@@ -14,15 +14,15 @@ EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 
 class ReadMode:
-    NO_FLAG = 0
-    NO_WAIT = 1
-    TIMEOUT = 2
+    NO_FLAG = 0  # Blocking read
+    NO_WAIT = 1  # Non-blocking read
+    TIMEOUT = 2  # TODO: Implement timeout, I think
 
 class Packet:
     def __init__(self, seq=0, ack=0, flags=0, payload=b""):
         self.seq = seq
         self.ack = ack
-        self.flags = flags
+        self.flags = flags  # Int determined by ReadMode
         self.payload = payload
 
     def encode(self):
@@ -43,14 +43,39 @@ class TransportSocket:
     def __init__(self):
         self.sock_fd = None
 
-        # Locks and condition
+        # Locks and condition (Synchronize backend thread and app/API thread)
         self.recv_lock = threading.Lock()
-        self.send_lock = threading.Lock()
-        self.wait_cond = threading.Condition(self.recv_lock)
+        #   - Protects access to receive buffer and window dictionary data (only 1 app thread, atomicity)
+        #   - Sync state, updates, prevent corruption, etc.
 
-        self.death_lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        #   - Protects access to send operations and window dictionary data (only 1 app thread, atomicity)
+
+        # Blocking Read Usage: App level thread calls recv() OR wait_for_ack()
+        self.wait_cond = threading.Condition(self.recv_lock)
+        #   -> self.wait_cond.wait() : due to blocking call to recv() 
+        #           - but no data in buffer
+        #           - wait() releases self.recv_lock
+        #           - puts app level thread to sleep
+        #           - ... after awoken, can perform the read
+        #   -> self.wait_cond.notify_all() : due to backend receiving valid data packet
+        #           - acquires self.recv_lock
+        #           - updates buffer and recv_len, releases lock
+        #           - acquires lock with wait_cond to wake up threads, releases the lock
+        #           - notify_all() : defense programming to wake up all threads,
+        #                            though concurrent recv() calls to TransportSocket may be a 
+        #                            design issue
+
+        self.death_lock = threading.Lock()  # Signals thread termination
+        #   - Useful when dealing with a shutdown state, not just an atomic boolean, 
+        #       need to send last data and clean up socket (FIN)
+        #   - Useful if App thread performs concurrent actions that updates the self.dying obj, maybe a timeout thread
+        #   - Helps protect against multiple close() calls (not likely), and creates memory visibility (likely) to
+        #       synchronize backend read of self.dying by app modifications to it
+        #   - Protects against torn reads, compiler optimizations, etc.
+
         self.dying = False
-        self.thread = None
+        self.thread = None  # For backend() thread, always running
 
         self.window = {
             "last_ack": 0,            # The next seq we expect from peer (used for receiving data)
@@ -117,6 +142,9 @@ class TransportSocket:
         """
         if not self.conn:
             raise ValueError("Connection not established.")
+        
+        # Handles concurrent send() calls from app level threads
+        #   - does NOT block the backend thread
         with self.send_lock:
             self.send_segment(data)
 
