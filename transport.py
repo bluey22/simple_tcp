@@ -14,6 +14,7 @@ _DEFAULT_TIMEOUT = DEFAULT_TIMEOUT                        # Default retransmissi
 _MAX_NETWORK_BUFFER = MAX_NETWORK_BUFFER                  # Maximum network buffer size (64KB)
 _WINDOW_INITIAL_WINDOW_SIZE = WINDOW_INITIAL_WINDOW_SIZE  # Initial window size (in MSS)
 _WINDOW_INITIAL_SSTHRESH = WINDOW_INITIAL_SSTHRESH        # Initial slow start threshold
+_ALPHA = 0.125
 
 # Setup logging
 logging.basicConfig(
@@ -55,16 +56,16 @@ class Packet:
             seq=0, 
             ack=0, 
             flags=0, 
-            advertised_window=_MAX_NETWORK_BUFFER,
+            adv_window=_MAX_NETWORK_BUFFER,
             sack_left=0,
             sack_right=0,
             payload=b""):
         self.seq = seq
         self.ack = ack
-        self.flags = flags                          # ReadMode flag
-        self.advertised_window = advertised_window  # Advertised window size
-        self.sack_left = sack_left                  # Left edge of SACK block
-        self.sack_right = sack_right                # Right edge of SACK block
+        self.flags = flags            # Control Flags (SYN, ACK, FIN)
+        self.adv_window = adv_window  # Advertised window size
+        self.sack_left = sack_left    # Left edge of SACK block
+        self.sack_right = sack_right  # Right edge of SACK block
         self.payload = payload
 
     def encode(self):
@@ -98,9 +99,10 @@ class Packet:
 
 class TransportSocket:
     def __init__(self):
+        # Frontend Conn Socket
         self.sock_fd = None
 
-        # Locks and condition (Synchronize backend thread and app/API thread)
+        # Locks and Condition (Synchronize backend thread and app/API thread)
         self.recv_lock = threading.Lock()
         #   - Protects access to receive buffer and window dictionary data (only 1 app thread, atomicity)
         #   - Sync state, updates, prevent corruption, etc.
@@ -131,20 +133,48 @@ class TransportSocket:
         #       synchronize backend read of self.dying by app modifications to it
         #   - Protects against torn reads, compiler optimizations, etc.
 
+        # Socket State
         self.dying = False
-        self.thread = None  # For backend() thread, always running
+        self.thread = None  # For backend() thread
+        self.state = TCPState.CLOSED
+        self.state_lock = threading.Lock()  # Safe read/writes to self.state
 
+        # Flow control and reliability
         self.window = {
-            "last_ack": 0,            # The next seq we expect from peer (used for receiving data)
-            "next_seq_expected": 0,   # The highest ack we've received for *our* transmitted data
-            "recv_buf": b"",          # Received data buffer
-            "recv_len": 0,            # How many bytes are in recv_buf
-            "next_seq_to_send": 0,    # The sequence number for the next packet we send
+            "last_ack": 0,                      # The next seq we expect from peer (used for receiving data)
+            "next_seq_expected": 0,             # The highest ack we've received for *our* transmitted data
+            "recv_buf": b"",                    # Received data buffer
+            "recv_len": 0,                      # How many bytes are in recv_buf
+            "next_seq_to_send": 0,              # The sequence number for the next packet we send
+            "adv_window": _MAX_NETWORK_BUFFER,  # Advertised window from peer
+            "send_buffer": {},                  # Buffer for sent but unacknowledged data
+            "unordered_data": {},               # Buffer for received out-of-order data
         }
+
+        # Connection Info
         self.sock_type = None
         self.conn = None
         self.my_port = None
 
+        # RTT estimation
+        self.rtt_estimation = {
+            "estimated_rtt": 1.0,     # Initial estimated RTT (seconds)
+            "alpha": _ALPHA,          # EWMA weight factor (recommended in RFC)
+            "last_sample": None,      # Last RTT sample
+            "timestamp": {},          # Timestamp when a segment was sent
+        }
+        
+        # SACK and duplicate ACK detection
+        self.dup_acks = 0
+        self.last_ack_received = 0
+        self.sack_blocks = []
+
+    def set_state(self, new_state):
+        """Set the TCP state with proper locking."""
+        with self.state_lock:
+            logger.info(f"Transitioning from {self.state} to {new_state}")
+            self.state = new_state
+            
     def socket(self, sock_type, port, server_ip=None):
         """
         Create and initialize the socket, setting its type and starting the backend thread.
