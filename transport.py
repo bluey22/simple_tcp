@@ -1,8 +1,26 @@
+# transport.py
+import logging
 import socket
 import struct
 import threading
-import time  
-from grading import MSS, DEFAULT_TIMEOUT
+import time
+from collections import defaultdict
+from enum import Enum
+from grading import *
+
+# Settings
+_MSS = MSS                                                # Maximum Segment Size
+_DEFAULT_TIMEOUT = DEFAULT_TIMEOUT                        # Default retransmission timeout (seconds)
+_MAX_NETWORK_BUFFER = MAX_NETWORK_BUFFER                  # Maximum network buffer size (64KB)
+_WINDOW_INITIAL_WINDOW_SIZE = WINDOW_INITIAL_WINDOW_SIZE  # Initial window size (in MSS)
+_WINDOW_INITIAL_SSTHRESH = WINDOW_INITIAL_SSTHRESH        # Initial slow start threshold
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -13,30 +31,69 @@ SACK_FLAG = 0x1  # Selective Acknowledgment flag
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 
+# TCP Connection State:
+class TCPState(Enum):
+    CLOSED = 0
+    LISTEN = 1
+    SYN_SENT = 2
+    SYN_RECEIVED = 3
+    ESTABLISHED = 4
+    FIN_WAIT_1 = 5
+    FIN_WAIT_2 = 6
+    CLOSE_WAIT = 7
+    LAST_ACK = 8
+    TIME_WAIT = 9
+
 class ReadMode:
     NO_FLAG = 0  # Blocking read
     NO_WAIT = 1  # Non-blocking read
-    TIMEOUT = 2  # TODO: Implement timeout, I think
+    TIMEOUT = 2  # Timeout-based read
 
 class Packet:
-    def __init__(self, seq=0, ack=0, flags=0, payload=b""):
+    def __init__(
+            self, 
+            seq=0, 
+            ack=0, 
+            flags=0, 
+            advertised_window=_MAX_NETWORK_BUFFER,
+            sack_left=0,
+            sack_right=0,
+            payload=b""):
         self.seq = seq
         self.ack = ack
-        self.flags = flags  # Int determined by ReadMode
+        self.flags = flags                          # ReadMode flag
+        self.advertised_window = advertised_window  # Advertised window size
+        self.sack_left = sack_left                  # Left edge of SACK block
+        self.sack_right = sack_right                # Right edge of SACK block
         self.payload = payload
 
     def encode(self):
         # Encode the packet header and payload into bytes
-        header = struct.pack("!IIIH", self.seq, self.ack, self.flags, len(self.payload))
+        # Format (in bytes):
+        #       - seq(4)
+        #       - ack(4)
+        #       - flags(1)
+        #       - advertised_window(2)
+        #       - sack_left(4)
+        #       - sack_right(4)
+        #       - payload_len(2)
+        header = struct.pack("!IIBHIIH", 
+                            self.seq, 
+                            self.ack, 
+                            self.flags, 
+                            self.adv_window,
+                            self.sack_left,
+                            self.sack_right,
+                            len(self.payload))
         return header + self.payload
 
     @staticmethod
     def decode(data):
         # Decode bytes into a Packet object
-        header_size = struct.calcsize("!IIIH")
-        seq, ack, flags, payload_len = struct.unpack("!IIIH", data[:header_size])
-        payload = data[header_size:]
-        return Packet(seq, ack, flags, payload)
+        header_size = struct.calcsize("!IIBHIIH")
+        seq, ack, flags, adv_window, sack_left, sack_right, payload_len = struct.unpack("!IIBHIIH", data[:header_size])
+        payload = data[header_size:header_size+payload_len]
+        return Packet(seq, ack, flags, adv_window, sack_left, sack_right, payload)
 
 
 class TransportSocket:
@@ -200,7 +257,7 @@ class TransportSocket:
 
         # While there's data left to send
         while offset < total_len:
-            payload_len = min(MSS, total_len - offset)
+            payload_len = min(_MSS, total_len - offset)
 
             # Current sequence number
             seq_no = self.window["next_seq_to_send"]
@@ -229,14 +286,14 @@ class TransportSocket:
 
     def wait_for_ack(self, ack_goal):
         """
-        Wait for 'next_seq_expected' to reach or exceed 'ack_goal' within DEFAULT_TIMEOUT.
+        Wait for 'next_seq_expected' to reach or exceed 'ack_goal' within _DEFAULT_TIMEOUT.
         Return True if ack arrived in time; False on timeout.
         """
         with self.recv_lock:
             start = time.time()
             while self.window["next_seq_expected"] < ack_goal:
                 elapsed = time.time() - start
-                remaining = DEFAULT_TIMEOUT - elapsed
+                remaining = _DEFAULT_TIMEOUT - elapsed
                 if remaining <= 0:
                     return False
 
