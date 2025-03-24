@@ -67,4 +67,4 @@ __pypackages__/
 # PyPI configuration file
 .pypirc
 
-sandbox.py
+sandbox
