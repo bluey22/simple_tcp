@@ -5,11 +5,10 @@ import struct
 import threading
 import time
 import random
-from collections import defaultdict
 from enum import Enum
 from grading import *
 
-# Settings
+# Settings - From grading.py or explicit here
 _MSS = MSS                                                # Maximum Segment Size
 _DEFAULT_TIMEOUT = DEFAULT_TIMEOUT                        # Default retransmission timeout (seconds)
 _MAX_NETWORK_BUFFER = MAX_NETWORK_BUFFER                  # Maximum network buffer size (64KB)
@@ -31,21 +30,48 @@ ACK_FLAG = 0x4   # Acknowledgment flag
 FIN_FLAG = 0x2   # Finish flag 
 SACK_FLAG = 0x1  # Selective Acknowledgment flag 
 
+# Constants for API response codes
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 
 # TCP Connection State:
 class TCPState(Enum):
-    CLOSED = 0
-    LISTEN = 1
-    SYN_SENT = 2
-    SYN_RECEIVED = 3
-    ESTABLISHED = 4
-    FIN_WAIT_1 = 5
-    FIN_WAIT_2 = 6
-    CLOSE_WAIT = 7
-    LAST_ACK = 8
-    TIME_WAIT = 9
+    # Initial States
+    CLOSED = 0          # Initial state when no connection exists
+    LISTEN = 1          # Server is waiting for connection requests
+
+    # Connection establishment
+    SYN_SENT = 2        # Client has sent SYN, now waiting for SYN+ACK
+    SYN_RECEIVED = 3    # Server received SYN, sent SYN+ACK. waiting for ACK
+    ESTABLISHED = 4     # Connection established, data can be exchanged (SYN, SYNACK, ACK)
+
+    # Connection termination - initiator/client path
+    FIN_WAIT_1 = 5      # Initiator sent FIN, waiting for ACK
+    FIN_WAIT_2 = 6      # Initiator received ACK for FIN, sent ACK, app needs to close
+    TIME_WAIT = 7        # Waiting to ensure remote TCP received the ACK of its FIN
+
+    # Connection termination - receiver/server path
+    CLOSE_WAIT = 8      # Receiver received FIN, sent ACK, app needs to close
+    LAST_ACK = 9        # Receiver sent FIN, waiting for final ACK
+
+    # Special case - both sides initiating close
+    CLOSING = 10         # Both sides sent FIN at the same time, waiting for ACK
+
+    # Client (Active Open):
+    #   - CLOSED → SYN_SENT: Client sends SYN
+    #   - SYN_SENT → ESTABLISHED: Client receives SYN+ACK, sends ACK
+    #   - ESTABLISHED → FIN_WAIT_1: Client sends FIN
+    #   - FIN_WAIT_1 → FIN_WAIT_2: Client receives ACK for FIN
+    #   - FIN_WAIT_2 → TIME_WAIT: Client receives FIN, sends ACK
+    #   - TIME_WAIT → CLOSED: After 2*MSL timeout
+    # 
+    # Server (Passive Open):
+    #   - CLOSED → LISTEN: Server listens for connections
+    #   - LISTEN → SYN_RECEIVED: Server receives SYN, sends SYN+ACK
+    #   - SYN_RECEIVED → ESTABLISHED: Server receives ACK
+    #   - ESTABLISHED → CLOSE_WAIT: Server receives FIN, sends ACK
+    #   - CLOSE_WAIT → LAST_ACK: Server sends FIN
+    #   - LAST_ACK → CLOSED: Server receives ACK for FIN
 
 class ReadMode:
     NO_FLAG = 0  # Blocking read
@@ -69,6 +95,16 @@ class Packet:
         self.sack_left = sack_left    # Left edge of SACK block
         self.sack_right = sack_right  # Right edge of SACK block
         self.payload = payload
+        #   (SACK) Selective Acknowledgment allows the receiver to inform the sender about
+        #     non-contiguous blocks of data that have been received successfully
+        #
+        #   - sack_left is the starting sequence number of a successfully received data block (inclusive)
+        #   - sack_right is the ending sequence number (exclusive) of that block
+        #   - A SACK block is a range of numbers
+        #
+        #   e.g.,
+        #   - We can ACK 2000, but SACK (3000, 4000), meaning we want (2000, 3000) - Missing Block
+        #   - Sender can resend missing block only
 
     def encode(self):
         # Encode the packet header and payload into bytes
@@ -80,6 +116,12 @@ class Packet:
         #       - sack_left(4)
         #       - sack_right(4)
         #       - payload_len(2)
+        # 
+        # Binary String Packing:
+        # ! - Network byte order (big endian)
+        # I - Unsigned int (4 bytes) 
+        # B - Unsigned char (1 byte)
+        # H - Unsigned short (2 bytes)
         header = struct.pack("!IIBHIIH", 
                             self.seq, 
                             self.ack, 
@@ -104,7 +146,7 @@ class TransportSocket:
         # Frontend Conn Socket
         self.sock_fd = None
 
-        # Locks and Condition (Synchronize backend thread and app/API thread)
+        # Locks (Synchronize backend thread and app/API thread)
         self.recv_lock = threading.Lock()
         #   - Protects access to receive buffer and window dictionary data (only 1 app thread, atomicity)
         #   - Sync state, updates, prevent corruption, etc.
@@ -141,6 +183,11 @@ class TransportSocket:
         self.state = TCPState.CLOSED
         self.state_lock = threading.Lock()  # Safe read/writes to self.state
 
+        # Connection Info
+        self.sock_type = None
+        self.conn = None  # Set by client during socket() creation or by server when first packet is received
+        self.my_port = None
+
         # Flow Control and Reliability
         self.window = {
             "last_ack": 0,                      # The next seq we expect from peer (used for receiving data)
@@ -149,14 +196,14 @@ class TransportSocket:
             "recv_len": 0,                      # How many bytes are in recv_buf
             "next_seq_to_send": 0,              # The sequence number for the next packet we send
             "adv_window": _MAX_NETWORK_BUFFER,  # Advertised window from peer
-            "send_buffer": {},                  # Buffer for sent but unacknowledged data
-            "unordered_data": {},               # Buffer for received out-of-order data
-        }
 
-        # Connection Info
-        self.sock_type = None
-        self.conn = None
-        self.my_port = None
+            "send_buffer": {},      # Buffer for sent but unacknowledged data
+            #   - { key: seq#, val: (data_chunk/payload, send_time) }
+            #   - For retransmission, RTT estimation, Flow Control, Fast Retransmit and SACK
+
+            "unordered_data": {},   # Buffer for received out-of-order data
+            #   - { key: seq#, val: data_chunk }
+        }
 
         # RTT estimation
         self.rtt_estimation = {
@@ -164,23 +211,13 @@ class TransportSocket:
             "alpha": _ALPHA,          # EWMA weight factor (recommended in RFC)
             "last_sample": None,      # Last RTT sample
             "timestamp": {},          # Timestamp when a segment was sent
+            #   - { key: seq#, val: time.time() }
         }
         
         # SACK and duplicate ACK detection
         self.dup_acks = 0
         self.last_ack_received = 0
         self.sack_blocks = []
-
-    def set_state(self, new_state):
-        """Set the TCP state with proper locking."""
-        with self.state_lock:
-            logger.info(f"Transitioning from {self.state} to {new_state}")
-            self.state = new_state
-    
-    def get_state(self):
-        """Get the current TCP state with proper locking."""
-        with self.state_lock:
-            return self.state
             
     # ---------------------------- Public API Methods ------------------------------------
     def socket(self, sock_type, port, server_ip=None):
@@ -191,11 +228,11 @@ class TransportSocket:
         self.sock_type = sock_type
 
         if sock_type == "TCP_INITIATOR":
-            self.set_state(TCPState.CLOSED)
+            self._set_state(TCPState.CLOSED)
             self.conn = (server_ip, port)
             self.sock_fd.bind(("", 0))  # Bind to any available local port
         elif sock_type == "TCP_LISTENER":
-            self.set_state(TCPState.LISTEN)
+            self._set_state(TCPState.LISTEN)
             self.sock_fd.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.sock_fd.bind(("", port))
         else:
@@ -203,6 +240,7 @@ class TransportSocket:
             return EXIT_ERROR
 
         # 1-second timeout so we can periodically check `self.dying`
+        # TODO: Verify
         self.sock_fd.settimeout(1.0)
 
         self.my_port = self.sock_fd.getsockname()[1]
@@ -221,7 +259,7 @@ class TransportSocket:
             logger.error("connect() can only be called on TCP_INITIATOR sockets")
             return EXIT_ERROR
         
-        if self.get_state() != TCPState.CLOSED:
+        if self._get_state() != TCPState.CLOSED:
             logger.error("Socket is not in CLOSED state ()")
             return EXIT_ERROR
         
@@ -235,7 +273,7 @@ class TransportSocket:
         self.rtt_estimation["timestamp"][initial_seq] = time.time()
 
         # 4. Update state
-        self.set_state(TCPState.SYN_SENT)
+        self._set_state(TCPState.SYN_SENT)
         logger.info(f"Sent SYN packet with initial seq={initial_seq}")
 
         # 5. Wait for SYN-ACK (with timeout, blocking)
@@ -246,13 +284,13 @@ class TransportSocket:
             # Sleep and check if state changed to ESTABLISHED 
             #   (backend thread handles setting from SYN-ACK)
             time.sleep(0.1)
-            if self.get_state() == TCPState.ESTABLISHED:
+            if self._get_state() == TCPState.ESTABLISHED:
                 connected = True
 
         # Check timeout
         if not connected:
             logger.error("Connection timed out waiting for SYN-ACK")
-            self.set_state(TCPState.CLOSED)  # Close connection, valid state to try again
+            self._set_state(TCPState.CLOSED)  # Close connection, valid state to try again
             return EXIT_ERROR
         
         logger.info("Connection established")
@@ -267,7 +305,7 @@ class TransportSocket:
             logger.error("accept() can only be called on TCP_LISTENER sockets")
             return EXIT_ERROR
             
-        if self.get_state() != TCPState.LISTEN:
+        if self._get_state() != TCPState.LISTEN:
             logger.error("Socket is not in LISTEN state")
             return EXIT_ERROR
         
@@ -279,7 +317,7 @@ class TransportSocket:
             # Wait for state to change to ESTABLISHED
             # (backend thread will set and send SYN-ACK)
             time.sleep(1.0)
-            if self.get_state() == TCPState.ESTABLISHED:
+            if self._get_state() == TCPState.ESTABLISHED:
                 accepted = True
         
         if not accepted:
@@ -289,14 +327,24 @@ class TransportSocket:
         logger.info("Connection accepted")
         return EXIT_SUCCESS
 
-
     def close(self):
         """
         Close the socket and stop the backend thread.
         """
 
         # 1. Evaluate current state to apply close()
-        current_state = self.get_state()
+        current_state = self._get_state()
+
+        # Handle connection termination based on current state
+        if current_state in [TCPState.ESTABLISHED, TCPState.SYN_RECEIVED]:
+            # Active close - send FIN
+            self._initiate_active_close()
+        elif current_state == TCPState.CLOSE_WAIT:
+            # Passive close - respond to received FIN with our own FIN
+            self._complete_passive_close()
+        elif current_state in [TCPState.SYN_SENT, TCPState.LISTEN]:
+            # No connection to terminate, just close
+            self._set_state(TCPState.CLOSED)
 
         if current_state == TCPState.ESTABLISHED:
             # TODO: Throw this in private methods
@@ -316,11 +364,11 @@ class TransportSocket:
             
             # Wait for FIN-ACK and FIN from peer (10 seconds)
             timeout = time.time() + 10
-            while time.time() < timeout and self.get_state() != TCPState.TIME_WAIT:
+            while time.time() < timeout and self._get_state() != TCPState.TIME_WAIT:
                 time.sleep(0.1)
             
             # Enter TIME_WAIT state for 2*MSL
-            if self.get_state() == TCPState.TIME_WAIT:
+            if self._get_state() == TCPState.TIME_WAIT:
                 logger.info("Entering TIME_WAIT state for 2*MSL")
                 time.sleep(2)
                 self.set_state(TCPState.CLOSED)
@@ -352,7 +400,7 @@ class TransportSocket:
             raise ValueError("Connection not established.")
         
         # TODO: Remove and instead queue concurrent send() calls
-        if self.get_state() != TCPState.ESTABLISHED:
+        if self._get_state() != TCPState.ESTABLISHED:
             raise ValueError("Connection not in ESTABLISHED state.")
         
         # Handles concurrent send() calls from app level threads
@@ -405,6 +453,18 @@ class TransportSocket:
 
         return read_len
 
+    # --------------------------- Private/Internal Methods ----------------------------
+    def _set_state(self, new_state):
+        """Set the TCP state with proper locking."""
+        with self.state_lock:
+            logger.info(f"Transitioning from {self.state} to {new_state}")
+            self.state = new_state
+    
+    def _get_state(self):
+        """Get the current TCP state with proper locking."""
+        with self.state_lock:
+            return self.state
+        
     def send_segment(self, data):
         """
         Send 'data' in multiple MSS-sized segments and reliably wait for each ACK

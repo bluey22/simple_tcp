@@ -11,4 +11,7 @@ Implements a simplified for TCP with custom header packet headers, and flow/cong
 # Order of progress
 - Added TCPState enum to track (https://book.systemsapproach.org/e2e/tcp.html#adaptive-retransmission)
 - Updated packet header format (seq, ack, ctrl_flags, adv_window, SACK Block)
-
+- Implemented Connection Management (SYN, FIN, and ACKS)
+- Add reliable data transfer with sliding window
+- Add RTT estimation
+- Implement SACK and fast retransmit
