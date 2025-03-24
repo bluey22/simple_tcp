@@ -246,7 +246,7 @@ class TransportSocket:
         self.my_port = self.sock_fd.getsockname()[1]
 
         # Start the backend thread
-        self.thread = threading.Thread(target=self.backend, daemon=True)
+        self.thread = threading.Thread(target=self._backend, daemon=True)
         self.thread.start()
         return EXIT_SUCCESS
     
@@ -265,7 +265,7 @@ class TransportSocket:
         
         # 2. Initiator formulates request packet
         initial_seq = random.randint(0, 65535)  # Initiator selects a random initial sequence number
-        self.window["next_seq_to_send"] = initial_seq
+        self.window["next_seq_to_send"] = initial_seq  # Single threaded connect mode, no need for lock
         syn_packet = Packet(seq=initial_seq, flags=SYN_FLAG, adv_window=MAX_NETWORK_BUFFER)
 
         # 3. Send SYN packet and mark send time for RTT estimation
@@ -335,7 +335,11 @@ class TransportSocket:
         # 1. Evaluate current state to apply close()
         current_state = self._get_state()
 
-        # Handle connection termination based on current state
+        # 2. Handle pending sends and receives
+        self._ensure_all_data_sent()
+        #   - Reads handled by app level (Don't call close if still want to read)
+
+        # 3. Handle connection termination based on current state
         if current_state in [TCPState.ESTABLISHED, TCPState.SYN_RECEIVED]:
             # Active close - send FIN
             self._initiate_active_close()
@@ -345,36 +349,8 @@ class TransportSocket:
         elif current_state in [TCPState.SYN_SENT, TCPState.LISTEN]:
             # No connection to terminate, just close
             self._set_state(TCPState.CLOSED)
-
-        if current_state == TCPState.ESTABLISHED:
-            # TODO: Throw this in private methods
-            # Send FIN packet
-            fin_packet = Packet(
-                seq=self.window["next_seq_to_send"],
-                ack=self.window["last_ack"],
-                flags=FIN_FLAG,
-                adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
-            )
-            self.sock_fd.sendto(fin_packet.encode(), self.conn)
-            logger.info(f"Sent FIN packet with seq={fin_packet.seq}")
-
-            # Update state
-            self.window["next_seq_to_send"] += 1  # FIN consumes 1 sequence number
-            self.set_state(TCPState.FIN_WAIT_1)
-            
-            # Wait for FIN-ACK and FIN from peer (10 seconds)
-            timeout = time.time() + 10
-            while time.time() < timeout and self._get_state() != TCPState.TIME_WAIT:
-                time.sleep(0.1)
-            
-            # Enter TIME_WAIT state for 2*MSL
-            if self._get_state() == TCPState.TIME_WAIT:
-                logger.info("Entering TIME_WAIT state for 2*MSL")
-                time.sleep(2)
-                self.set_state(TCPState.CLOSED)
-
         
-        # 2. Signal the backend thread to terminate
+        # 4. Signal the backend thread to terminate
         self.death_lock.acquire()
         try:
             self.dying = True
@@ -465,9 +441,74 @@ class TransportSocket:
         with self.state_lock:
             return self.state
         
+    def _ensure_all_data_sent(self):
+        """
+        Calculated wait that monitors the send_buffer (sent but unacknowledged data)
+        """
+        # 1. Acquire send_lock to check the send_buffer
+        with self.send_lock:
+            if self.window["send_buffer"]:
+                logger.info("Waiting for all data to be acknowledged before closing")
+                
+                # 2. Wait loop for acknowledgements
+                deadline = time.time() + 10
+                while self.window["send_buffer"] and time.time() < deadline:
+                    self.send_lock.release()
+                    time.sleep(0.2)
+                    self.send_lock.acquire()
+                
+                # 3. Exit
+                if self.window["send_buffer"]:
+                    logger.warning("Closing with unsent data - connection may be lost")
+
+    def _initiate_active_close(self):
+        # 1. Create FIN Packet and send
+        fin_packet = Packet(
+            seq=self.window["next_seq_to_send"], 
+            ack=self.window["last_ack"], 
+            flags=FIN_FLAG,
+            adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
+        )
+        self.sock_fd.sendto(fin_packet.encode(), self.conn)
+        self.window["next_seq_to_send"] += 1  # FIN consumes 1 sequence number
+        self._set_state(TCPState.FIN_WAIT_1)
+        logger.info(f"Sent FIN packet with seq={fin_packet.seq}")
+        
+        # 2. Wait for FINACK or CLOSED (10 seconds)
+        timeout = time.time() + 10
+        while time.time() < timeout and self._get_state() not in [TCPState.TIME_WAIT, TCPState.CLOSED]:
+            time.sleep(0.2)
+            
+        # 3. Allow any delayed packets in the network to expire before fully closing the socket
+        #       - Prevents old duplicate packets from being misinterpreted
+        if self._get_state() == TCPState.TIME_WAIT:
+            logger.info("Entering TIME_WAIT state for 2*MSL")
+            time.sleep(2)
+            self._set_state(TCPState.CLOSED)
+    
+    def _complete_passive_close(self):
+        # 1. Create FIN Packet and send
+        fin_packet = Packet(
+            seq=self.window["next_seq_to_send"], 
+            ack=self.window["last_ack"], 
+            flags=FIN_FLAG,
+            adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
+        )
+        self.sock_fd.sendto(fin_packet.encode(), self.conn)
+        self.window["next_seq_to_send"] += 1  # FIN consumes 1 sequence number
+        self._set_state(TCPState.LAST_ACK)
+        logger.info(f"Sent FIN packet with seq={fin_packet.seq}")
+        
+        # 2. Wait for FINACK (transition to CLOSED)
+        timeout = time.time() + 5
+        while time.time() < timeout and self._get_state() != TCPState.CLOSED:
+            time.sleep(0.1)
+
     def send_segment(self, data):
         """
         Send 'data' in multiple MSS-sized segments and reliably wait for each ACK
+        
+        Runs under send lock, can safely access self.window's send contexts
         """
         offset = 0
         total_len = len(data)
@@ -518,7 +559,7 @@ class TransportSocket:
 
             return True
 
-    def backend(self):
+    def _backend(self):
         """
         Backend loop to handle receiving data and sending acknowledgments.
         All incoming packets are read in this thread only, to avoid concurrency conflicts.
