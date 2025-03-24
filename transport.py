@@ -4,6 +4,7 @@ import socket
 import struct
 import threading
 import time
+import random
 from collections import defaultdict
 from enum import Enum
 from grading import *
@@ -12,13 +13,14 @@ from grading import *
 _MSS = MSS                                                # Maximum Segment Size
 _DEFAULT_TIMEOUT = DEFAULT_TIMEOUT                        # Default retransmission timeout (seconds)
 _MAX_NETWORK_BUFFER = MAX_NETWORK_BUFFER                  # Maximum network buffer size (64KB)
-_WINDOW_INITIAL_WINDOW_SIZE = WINDOW_INITIAL_WINDOW_SIZE  # Initial window size (in MSS)
-_WINDOW_INITIAL_SSTHRESH = WINDOW_INITIAL_SSTHRESH        # Initial slow start threshold
+_MSL = 2.0                                                # Maximum segment lifetime (2.0s for testing)
+_WINDOW_INITIAL_WINDOW_SIZE = WINDOW_INITIAL_WINDOW_SIZE  # Initial window size (in MSS) - PART 2
+_WINDOW_INITIAL_SSTHRESH = WINDOW_INITIAL_SSTHRESH        # Initial slow start threshold - PART 2
 _ALPHA = 0.125
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -139,7 +141,7 @@ class TransportSocket:
         self.state = TCPState.CLOSED
         self.state_lock = threading.Lock()  # Safe read/writes to self.state
 
-        # Flow control and reliability
+        # Flow Control and Reliability
         self.window = {
             "last_ack": 0,                      # The next seq we expect from peer (used for receiving data)
             "next_seq_expected": 0,             # The highest ack we've received for *our* transmitted data
@@ -174,7 +176,13 @@ class TransportSocket:
         with self.state_lock:
             logger.info(f"Transitioning from {self.state} to {new_state}")
             self.state = new_state
+    
+    def get_state(self):
+        """Get the current TCP state with proper locking."""
+        with self.state_lock:
+            return self.state
             
+    # ---------------------------- Public API Methods ------------------------------------
     def socket(self, sock_type, port, server_ip=None):
         """
         Create and initialize the socket, setting its type and starting the backend thread.
@@ -183,9 +191,11 @@ class TransportSocket:
         self.sock_type = sock_type
 
         if sock_type == "TCP_INITIATOR":
+            self.set_state(TCPState.CLOSED)
             self.conn = (server_ip, port)
             self.sock_fd.bind(("", 0))  # Bind to any available local port
         elif sock_type == "TCP_LISTENER":
+            self.set_state(TCPState.LISTEN)
             self.sock_fd.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.sock_fd.bind(("", port))
         else:
@@ -201,11 +211,122 @@ class TransportSocket:
         self.thread = threading.Thread(target=self.backend, daemon=True)
         self.thread.start()
         return EXIT_SUCCESS
+    
+    def connect(self):
+        """
+        Establish a connection with the server (TCP three-way handshake)
+        """
+        # 1. Validate TCPState can connect()
+        if self.sock_type != "TCP_INITIATOR":
+            logger.error("connect() can only be called on TCP_INITIATOR sockets")
+            return EXIT_ERROR
+        
+        if self.get_state() != TCPState.CLOSED:
+            logger.error("Socket is not in CLOSED state ()")
+            return EXIT_ERROR
+        
+        # 2. Initiator formulates request packet
+        initial_seq = random.randint(0, 65535)  # Initiator selects a random initial sequence number
+        self.window["next_seq_to_send"] = initial_seq
+        syn_packet = Packet(seq=initial_seq, flags=SYN_FLAG, adv_window=MAX_NETWORK_BUFFER)
+
+        # 3. Send SYN packet and mark send time for RTT estimation
+        self.sock_fd.sendto(syn_packet.encode(), self.conn)
+        self.rtt_estimation["timestamp"][initial_seq] = time.time()
+
+        # 4. Update state
+        self.set_state(TCPState.SYN_SENT)
+        logger.info(f"Sent SYN packet with initial seq={initial_seq}")
+
+        # 5. Wait for SYN-ACK (with timeout, blocking)
+        timeout = time.time() + DEFAULT_TIMEOUT * 3  # Longer timeout for initial connection
+        connected = False
+
+        while time.time() < timeout and not connected:
+            # Sleep and check if state changed to ESTABLISHED 
+            #   (backend thread handles setting from SYN-ACK)
+            time.sleep(0.1)
+            if self.get_state() == TCPState.ESTABLISHED:
+                connected = True
+
+        # Check timeout
+        if not connected:
+            logger.error("Connection timed out waiting for SYN-ACK")
+            self.set_state(TCPState.CLOSED)  # Close connection, valid state to try again
+            return EXIT_ERROR
+        
+        logger.info("Connection established")
+        return EXIT_SUCCESS
+
+    def accept(self):
+        """
+        Accept an incoming connection (for listener sockets).
+        """
+        # 1. Validate TCPState can accept()
+        if self.sock_type != "TCP_LISTENER":
+            logger.error("accept() can only be called on TCP_LISTENER sockets")
+            return EXIT_ERROR
+            
+        if self.get_state() != TCPState.LISTEN:
+            logger.error("Socket is not in LISTEN state")
+            return EXIT_ERROR
+        
+        # 2. Wait for a connection to be established
+        timeout = time.time() + 30  # 30-second timeout for accept
+        accepted = False
+
+        while time.time() < timeout and not accepted:
+            # Wait for state to change to ESTABLISHED
+            # (backend thread will set and send SYN-ACK)
+            time.sleep(1.0)
+            if self.get_state() == TCPState.ESTABLISHED:
+                accepted = True
+        
+        if not accepted:
+            logger.error("Accept timed out waiting for connection")
+            return EXIT_ERROR
+    
+        logger.info("Connection accepted")
+        return EXIT_SUCCESS
+
 
     def close(self):
         """
         Close the socket and stop the backend thread.
         """
+
+        # 1. Evaluate current state to apply close()
+        current_state = self.get_state()
+
+        if current_state == TCPState.ESTABLISHED:
+            # TODO: Throw this in private methods
+            # Send FIN packet
+            fin_packet = Packet(
+                seq=self.window["next_seq_to_send"],
+                ack=self.window["last_ack"],
+                flags=FIN_FLAG,
+                adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
+            )
+            self.sock_fd.sendto(fin_packet.encode(), self.conn)
+            logger.info(f"Sent FIN packet with seq={fin_packet.seq}")
+
+            # Update state
+            self.window["next_seq_to_send"] += 1  # FIN consumes 1 sequence number
+            self.set_state(TCPState.FIN_WAIT_1)
+            
+            # Wait for FIN-ACK and FIN from peer (10 seconds)
+            timeout = time.time() + 10
+            while time.time() < timeout and self.get_state() != TCPState.TIME_WAIT:
+                time.sleep(0.1)
+            
+            # Enter TIME_WAIT state for 2*MSL
+            if self.get_state() == TCPState.TIME_WAIT:
+                logger.info("Entering TIME_WAIT state for 2*MSL")
+                time.sleep(2)
+                self.set_state(TCPState.CLOSED)
+
+        
+        # 2. Signal the backend thread to terminate
         self.death_lock.acquire()
         try:
             self.dying = True
@@ -230,10 +351,16 @@ class TransportSocket:
         if not self.conn:
             raise ValueError("Connection not established.")
         
+        # TODO: Remove and instead queue concurrent send() calls
+        if self.get_state() != TCPState.ESTABLISHED:
+            raise ValueError("Connection not in ESTABLISHED state.")
+        
         # Handles concurrent send() calls from app level threads
         #   - does NOT block the backend thread
         with self.send_lock:
             self.send_segment(data)
+        
+        return len(data)
 
     def recv(self, buf, length, flags):
         """
