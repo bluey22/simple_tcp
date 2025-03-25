@@ -4,10 +4,10 @@
 - Connection Establishment
 - Connection Termination
 - TCP State Transition Diagram
-- Sliding Window (todo)
-- Flow Control (todo)
-- Adaptive Retransmission (todo)
-
+- Sliding Window
+- Flow Control
+- Adaptive Retransmission
+- Congestion Control (todo)
 
 # Segment Format
 TCP is a byte-oriented protocol where a reasonable sized # of bytes are packaged in a packet/segment to be sent over the internet.
@@ -121,6 +121,83 @@ CLOSED:
 
 # TCP State Diagram
 <img src="./images/tcp_state_diagram.png" alt="TCP State Diagram" width="400"/>
+
+# Sliding Window Algorithm
+
+## General Sliding Window Algorithm:
+First, the sender assigns a sequence number, `SeqNum`. The sender maintains three variables:
+- `SWS` : Send Window Size
+- `LAR` : Last Acknowledgement Received
+- `LFS` : Last Frame Sent
+```
+LFS - LAR <= SWS
+```
+
+When an acknowledgement arrives, the sender moves LAR one spot to the right, making room for a new frame to be transmitted.
+
+The receiver maintains:
+- `RWS` : Receive Window Size, Upper Bound on # of OOO frames that can be accepted
+- `LAF` : Largest Acceptable Frame
+- `LFR` : The sequence number of the Last Frame Received
+```bash
+LAF - LFR <= RWS
+```
+
+In order to protect against wrap around, we also enforce another condition: 
+```bash
+SWS < (MaxSeqNum + 1) / 2
+```
+
+## TCP Sliding Window Algorithm:
+Differing from the general / link-level algorithm above, TCP does not have a fixed window size. Instead, the receiver advertises a window size to the sender (`AdvertisedWindow`).
+- The sender can not have more than `AdvertisedWindow` bytes of unacknowledged data at any time.
+
+The sender maintains 3 pointers for it's send buffer:
+- `LastByteAcked`
+- `LastByteSent`
+- `LastByteWritten`
+```bash
+LastByteAcked <= LastByteSent <= LastByteWritten
+```
+
+The receiver maintains 3 pointers (sequence numbers) for it's receive buffer:
+- `LastByteRead`
+- `NextByteExpected`
+- `LastByteRcvd`
+```bash
+LastByteRead < NextByteExpected
+
+NextByteExpected <= LastByteRcvd + 1  # There may be out of order segments read, then NextByteExpected points to the start of the first gap
+```
+
+See how these windows are managed with max sizes in Flow Control
+
+# Flow Control
+Both buffers have a `MaxSendBuffer` and `MaxRcvBuffer`.
+
+The size of the window sets the amount of data that can be sent without waiting for an ACK. The receiver throttles the sender with it's advertise window:
+```bash
+# On the receiving side:
+LastByteRcvd - LastByteRead <= MaxRcvBuffer
+
+AdvertisedWindow = MaxRcvBuffer - ((NextByteExpected - 1) - LastByteRead)
+
+# On the sending side:
+LastByteSent - LastByteAcked <= AdvertisedWindow
+
+EffectiveSendingWindow = AdvertisedWindow - (LastByteSent - LastByteAcked)
+
+LastByteWritten - LastByteAcked <= MaxSendBuffer
+```
+
+# Adaptive Retransmission
+TCP retransmits each segment if an ACK is not received in a certain period of time. We retransmit on triple duplicate ACKs or timeouts. Timeouts are determined as a function of the RTT (Exponential Weighted Moving Average).
+
+```bash
+EstimatedRTT = alpha * EstimatedRTT + (1 - alpha) * SampleRTT
+
+TimeOut = 2 * EstimatedRTT
+```
 
 ### Sources (for information and images)
 - https://book.systemsapproach.org/e2e/tcp.html#state-transition-diagram
