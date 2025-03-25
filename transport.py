@@ -218,6 +218,14 @@ class TransportSocket:
         self.dup_acks = 0
         self.last_ack_received = 0
         self.sack_blocks = []
+
+        # TransportSocket Helper Constants
+        self.VALID_READ_STATES = [
+                    TCPState.ESTABLISHED, 
+                    TCPState.FIN_WAIT_1, 
+                    TCPState.FIN_WAIT_2,
+                    TCPState.CLOSE_WAIT
+                ]
             
     # ---------------------------- Public API Methods ------------------------------------
     def socket(self, sock_type, port, server_ip=None):
@@ -395,34 +403,46 @@ class TransportSocket:
         :param flags: ReadMode flag to control blocking behavior
         :return: Number of bytes read
         """
+        # 1. Check Read Conditions and Block if we need to
         read_len = 0
 
         if length < 0:
             print("ERROR: Negative length")
             return EXIT_ERROR
 
-        # If blocking read, wait until there's data in buffer
+        # 1B. If blocking read, wait until there's data in buffer
         if flags == ReadMode.NO_FLAG:
             with self.wait_cond:
-                while self.window["recv_len"] == 0:
-                    self.wait_cond.wait()
+                current_state = self._get_state()
 
+                # Blocking loop
+                while self.window["recv_len"] == 0 and current_state in self.VALID_READ_STATES:
+                    self.wait_cond.wait(timeout=1.0)
+                    current_state = self._get_state()
+
+                # Time out, failed to recv data
+                if self.window["recv_len"] == 0 and current_state not in self.VALID_READ_STATES:
+                    return 0
+
+        # 2. Perform read
         self.recv_lock.acquire()
         try:
             if flags in [ReadMode.NO_WAIT, ReadMode.NO_FLAG]:
                 if self.window["recv_len"] > 0:
+                    # Calculate how many bytes to read
                     read_len = min(self.window["recv_len"], length)
-                    buf[0] = self.window["recv_buf"][:read_len]
+                    buf[0] = self.window["recv_buf"][:read_len]  # Copy data to buffer
 
-                    # Remove data from the buffer
+                    # Update receive buffer (or reset it if it's now empty)
                     if read_len < self.window["recv_len"]:
                         self.window["recv_buf"] = self.window["recv_buf"][read_len:]
                         self.window["recv_len"] -= read_len
                     else:
                         self.window["recv_buf"] = b""
                         self.window["recv_len"] = 0
+                    self._send_window_update()
             else:
-                print("ERROR: Unknown or unimplemented flag.")
+                logger.error("ERROR: Unknown or unimplemented flag.")
                 read_len = EXIT_ERROR
         finally:
             self.recv_lock.release()
