@@ -12,7 +12,7 @@ from grading import *
 _MSS = MSS                                                # Maximum Segment Size
 _DEFAULT_TIMEOUT = DEFAULT_TIMEOUT                        # Default retransmission timeout (seconds)
 _MAX_NETWORK_BUFFER = MAX_NETWORK_BUFFER                  # Maximum network buffer size (64KB)
-_MSL = 2.0                                                # Maximum segment lifetime (2.0s for testing)
+_MSL = 4.0  # Maximum segment lifetime (2.0s for testing, recommended: 120s)
 _WINDOW_INITIAL_WINDOW_SIZE = WINDOW_INITIAL_WINDOW_SIZE  # Initial window size (in MSS) - PART 2
 _WINDOW_INITIAL_SSTHRESH = WINDOW_INITIAL_SSTHRESH        # Initial slow start threshold - PART 2
 _ALPHA = 0.125
@@ -375,7 +375,7 @@ class TransportSocket:
         if not self.conn:
             raise ValueError("Connection not established.")
         
-        # TODO: Remove and instead queue concurrent send() calls
+        # We can all send data in a ESTABLISHED connection state
         if self._get_state() != TCPState.ESTABLISHED:
             raise ValueError("Connection not in ESTABLISHED state.")
         
@@ -483,7 +483,7 @@ class TransportSocket:
         #       - Prevents old duplicate packets from being misinterpreted
         if self._get_state() == TCPState.TIME_WAIT:
             logger.info("Entering TIME_WAIT state for 2*MSL")
-            time.sleep(2)
+            time.sleep(2*_MSL)
             self._set_state(TCPState.CLOSED)
     
     def _complete_passive_close(self):
