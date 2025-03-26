@@ -422,7 +422,7 @@ class TransportSocket:
                 # Wait for window space to be available
                 while self.window["in_flight"] >= self.window["peer_adv_window"]:
                     print(f"Flow control: waiting for window space (in_flight={self.window['in_flight']}, peer_window={self.window['peer_adv_window']})")
-                    self.wait_cond.wait(timeout=0.1)
+                    self.wait_cond.wait(timeout=0.3)
                     if self.dying:
                         return
                 
@@ -455,10 +455,8 @@ class TransportSocket:
                 self.rtt_estimation["timestamps"][seq_no] = time.time()
                 self.window["packets_in_flight"][seq_no] = (segment, time.time())
                 
-                # We expect an ACK for seq_no + payload_len
-                ack_goal = seq_no + payload_len
-                
-                # Wait for this segment to be acknowledged
+                # Check for ACKs on all sent packets
+                # TODO, potentially allow multiple calls to send() without blocks (use send buffer and offset)
                 start_wait = time.time()
                 while seq_no in self.window["packets_in_flight"]:
                     # Check for timeout and retransmit if needed
