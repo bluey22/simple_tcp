@@ -2,6 +2,7 @@ import os
 import random
 import string
 from transport import TransportSocket, ReadMode
+import time
 
 def generate_random_data(size):
     """
@@ -36,6 +37,7 @@ def server_main():
     server_socket.send(random_data)
 
     # Close the server socket
+    print(f"CALLING CLOSED! Time={time.time()}")
     server_socket.close()
 
 if __name__ == "__main__":
