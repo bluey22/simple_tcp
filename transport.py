@@ -1,4 +1,6 @@
 # transport.py
+#
+# - Ben Luo
 import logging
 import socket
 import struct
@@ -12,7 +14,7 @@ from grading import *
 _MSS = MSS                                # Maximum Segment Size
 _DEFAULT_TIMEOUT = DEFAULT_TIMEOUT        # Default retransmission timeout (seconds)
 _MAX_NETWORK_BUFFER = MAX_NETWORK_BUFFER  # Maximum network buffer size (64KB)
-_MSL = 20.0     # Maximum segment lifetime (20.0s for testing, recommended: 120s)
+_MSL = 4.0     # Maximum segment lifetime (4.0s for testing, recommended: 120s)
 _ALPHA = 0.125  # For RTT Estimation (Smoothing Factor)
 
 # Setup logging
@@ -49,8 +51,7 @@ class TCPState(Enum):
     ESTABLISHED = 4     # Connection established, data can be exchanged (SYN, SYNACK, ACK)
 
     # Connection termination - initiator/client path
-    FIN_WAIT_1 = 5      # Initiator sent FIN, waiting for ACK
-    FIN_WAIT_2 = 6      # Initiator received ACK for FIN, sent ACK, app needs to close
+    FIN_SENT = 5        # Sent FIN, waiting for ACK (Combined FIN_WAIT_1 and FIN_WAIT_2)
     TIME_WAIT = 7       # Waiting to ensure remote TCP received the ACK of its FIN
 
     # Connection termination - receiver/server path
@@ -311,7 +312,7 @@ class TransportSocket:
             adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
         )
         self.sock_fd.sendto(fin_packet.encode(), self.conn)
-        self.state = TCPState.FIN_WAIT_1
+        self.state = TCPState.FIN_SENT
         logger.info(f"Sent FIN packet with seq={fin_packet.seq}")
         
         # 2. Wait for ACK or FIN+ACK
@@ -335,7 +336,7 @@ class TransportSocket:
         # If in TIME_WAIT, wait for 2*MSL before fully closing
         if self.state == TCPState.TIME_WAIT:
             logging.info("In TIME_WAIT, waiting for 2*MSL...")
-            time.sleep(2 * _DEFAULT_TIMEOUT)
+            time.sleep(2 * _MSL)
             self.state = TCPState.CLOSED
         
         logging.info("Connection terminated")
@@ -554,6 +555,10 @@ class TransportSocket:
                 self.window["peer_adv_window"] = packet.adv_window
 
                 # 3. Evaluate the type of packet received and handle accordingly
+
+                # debug check (TODO: remove)
+                if packet.flags & FIN_FLAG != 0:
+                    logging.debug(f"RECEIVED FIN PACKET, seq={packet.seq}")
                 
                 # 3.1 CONNECTION ESTABLISHMENT CASES
                 if self.state == TCPState.LISTEN and (packet.flags & SYN_FLAG) != 0:
@@ -573,50 +578,24 @@ class TransportSocket:
 
                 # 3.2 CONNECTION TERMINATION CASES
                 elif self.state == TCPState.ESTABLISHED and (packet.flags & FIN_FLAG) != 0:
-                    # CASE 1: RECEIVE FIN REQUEST (LISTENER/PASSIVE CLOSE)
+                    # CASE 1: RECEIVE FIN REQUEST (LISTENER/PASSIVE CLOSE), ACK and send FIN
                     self._handle_fin_passive(addr, packet)
                     continue
 
-                elif self.state == TCPState.FIN_WAIT_1 and (packet.flags & ACK_FLAG) != 0:
-                    # Received ACK in FIN_SENT state
-                    with self.recv_lock:
-                        logging.info(f"Received ACK for FIN from {addr}")
-                        
-                        # Only transition if this is an ACK for our FIN
-                        if packet.ack > self.window["next_seq_expected"]:
-                            self.window["next_seq_expected"] = packet.ack
-                            self.state = TCPState.TIME_WAIT
-                            self.wait_cond.notify_all()
-                            
-                            # Schedule transition to CLOSED after 2*MSL
-                            threading.Timer(2 * _DEFAULT_TIMEOUT, self._time_wait_to_closed).start()
+                elif self.state == TCPState.FIN_SENT and (packet.flags & ACK_FLAG) != 0:
+                    # CASE 2: ALREADY SENT FIN, RECEIVED ACK (FOR INITIATOR)
+                    self._handle_ack_for_fin_initiator(addr, packet)
                     continue
 
-                elif self.state == TCPState.FIN_WAIT_2 and (packet.flags & FIN_FLAG) != 0:
-                    # Received FIN in FIN_SENT state (simultaneous close)
-                    with self.recv_lock:
-                        logging.info(f"Received FIN from {addr} (simultaneous close)")
-                        self.window["last_ack"] = packet.seq + 1
-                        
-                        # Send ACK
-                        ack_packet = Packet(
-                            seq=self.window["next_seq_to_send"], 
-                            ack=self.window["last_ack"], 
-                            flags=ACK_FLAG, 
-                            adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
-                        )
-                        self.sock_fd.sendto(ack_packet.encode(), addr)
-                        
-                        # Transition to TIME_WAIT
-                        self.state = TCPState.TIME_WAIT
-                        self.wait_cond.notify_all()
-                        
-                        # Schedule transition to CLOSED after 2*MSL
-                        threading.Timer(2 * _DEFAULT_TIMEOUT, self._time_wait_to_closed()).start()
+                elif (self.state == TCPState.FIN_SENT or self.state == TCPState.TIME_WAIT) and (packet.flags & FIN_FLAG) != 0:
+                    # CASE 3: HANDLING SIMULTANEOUS CLOSE
+                    # + EDGE CASE: FIN_WAIT_2 CASE, OUR FIN ACK'ED, BUT WE WANT TO BE SURE TO ACK THEIR FIN WHILE NOT TOTALLY DEAD
+                    #   - AKA, Combine FIN_WAIT_2 into TIME_WAIT
+                    self._handle_fin_after_fin_sent(addr, packet)
                     continue
 
                 elif self.state == TCPState.LAST_ACK and (packet.flags & ACK_FLAG) != 0:
-                    # Received ACK in LAST_ACK state (completing passive close)
+                    # CASE 4: FINISH PASSIVE CLOSE (RECEIVED ACK IN LAST_ACK STATE)
                     with self.recv_lock:
                         logging.info(f"Received final ACK from {addr}")
                         self.state = TCPState.CLOSED
@@ -854,5 +833,48 @@ class TransportSocket:
             self.sock_fd.sendto(fin_packet.encode(), addr)
             self.state = TCPState.LAST_ACK
 
+    def _handle_ack_for_fin_initiator(self, addr, packet):
+        """
+        For Initiator: Receive ACK for FIN, "do nothing"
+            - Our version of FIN_WAIT_1 to FIN_WAIT_2
+        """
+        with self.recv_lock:
+            logging.info(f"Received ACK for FIN from {addr} (Already sent FIN)")
+                        
+                        # Only transition if this is an ACK for our FIN
+            if packet.ack > self.window["next_seq_expected"]:
+                self.window["next_seq_expected"] = packet.ack
+                self.state = TCPState.TIME_WAIT
+                self.wait_cond.notify_all()
+                            
+                            # Schedule transition to CLOSED after 2*MSL
+                threading.Timer(2 * _MSL, self._time_wait_to_closed).start()
 
+    def _handle_fin_after_fin_sent(self, addr, packet):
+        """
+        For Initiator or Receiver: We deal with a simultaneous FIN and or a FIN reception after a ACK of our FIN
+            - We combine FIN_WAIT_2 scenario into our _TIME_WAIT, and increase the wait time by a factor of the
+            default timeout to allow for FIN_WAIT_2 handling
+        """
+        with self.recv_lock:
+            logging.info(f"Received Simultaneous FIN from {addr}")
+            self.window["last_ack"] = packet.seq + 1
+                        
+            # Send ACK
+            ack_packet = Packet(
+                            seq=self.window["next_seq_to_send"], 
+                            ack=self.window["last_ack"], 
+                            flags=ACK_FLAG, 
+                            adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
+                        )
+            self.sock_fd.sendto(ack_packet.encode(), addr)
+                        
+            # Transition to TIME_WAIT
+            logging.info(f"Sent ACK of FIN to {addr}, transitioning to {TCPState.TIME_WAIT} before closing socket")
+            self.state = TCPState.TIME_WAIT
+            self.wait_cond.notify_all()
+                        
+            # Schedule transition to CLOSED after 2*MSL + 2*DEFAULT_TIMEOUT
+            # wait_time = (2*_MSL) + (2*_DEFAULT_TIMEOUT)
+            # threading.Timer(wait_time, self._time_wait_to_closed).start()
 
