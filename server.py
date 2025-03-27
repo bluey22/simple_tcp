@@ -37,7 +37,6 @@ def server_main():
     server_socket.send(random_data)
 
     # Close the server socket
-    print(f"CALLING CLOSED! Time={time.time()}")
     server_socket.close()
 
 if __name__ == "__main__":

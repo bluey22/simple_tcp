@@ -10,10 +10,6 @@ Please see [TCP Notes](tcp_notes.md) for further information about TCP.
 # Complete TCP State Machine
 <img src="./images/tcp_state_diagram.png" alt="TCP State Diagram" width="400"/>
 
-# Order of progress
-- Added TCPState enum to track (https://book.systemsapproach.org/e2e/tcp.html#adaptive-retransmission)
-- Updated packet header format (seq, ack, ctrl_flags, adv_window, SACK Block)
-- Implemented Connection Management (SYN, FIN, and ACKS)
-- Add reliable data transfer with sliding window
-- Add RTT estimation
-- Implement SACK and fast retransmit
+# HOW TO RUN
+1) Open up two terminals
+2) run server.py in one, and client.py in the other. You can observe the outputs or use wireshark

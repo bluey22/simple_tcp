@@ -52,11 +52,13 @@ class TCPState(Enum):
 
     # Connection termination - initiator/client path
     FIN_SENT = 5        # Sent FIN, waiting for ACK (Combined FIN_WAIT_1 and FIN_WAIT_2)
-    TIME_WAIT = 7       # Waiting to ensure remote TCP received the ACK of its FIN
+    #   - see _handle_ack_for_fin_initiator() on this combining of FIN states, 
+    #       and extra processing in TIME_WAIT (with added time)
+    TIME_WAIT = 6       # Waiting to ensure remote TCP received the ACK of its FIN
 
     # Connection termination - receiver/server path
-    CLOSE_WAIT = 8      # Receiver received FIN, sent ACK, app needs to close
-    LAST_ACK = 9        # Receiver sent FIN, waiting for final ACK
+    CLOSE_WAIT = 7      # Receiver received FIN, sent ACK, app needs to close
+    LAST_ACK = 8        # Receiver sent FIN, waiting for final ACK
 
 
 class Packet:
@@ -169,6 +171,7 @@ class TransportSocket:
         """
         Close the socket and stop the backend thread.
         """
+        logging.info("close() called on TransportSocket")
         self._ensure_all_data_sent()
 
         # Handle connection termination based on the current state
@@ -176,7 +179,8 @@ class TransportSocket:
             logging.debug("Initiated Close")
             self._initiate_close()
         elif self.state == TCPState.CLOSE_WAIT:
-            logging.debug("Passive Close")
+            logging.debug("Passive Close (edge case)")
+            # True Passive Close is handled in backend, explanation can be found in _handle_close_wait() description
             self._handle_close_wait()
         
         # Tell the backend threat to stop
@@ -198,6 +202,7 @@ class TransportSocket:
             logging.info("Error: Null socket")
             return EXIT_ERROR
 
+        logging.debug(f"Finishing exiting with state = {self.state}")
         logging.info("close() completed successfully")
         return EXIT_SUCCESS
 
@@ -217,6 +222,7 @@ class TransportSocket:
         if self.state != TCPState.ESTABLISHED:
             raise ValueError("Connection not in ESTABLISHED state.")
         
+        logging.debug(f"API CALL: send(data) called with data = {data}")
         with self.send_lock:
             self._send_segment(data)
 
@@ -333,16 +339,19 @@ class TransportSocket:
                 if self.dying:
                     break
         
-        # If in TIME_WAIT, wait for 2*MSL before fully closing
+        # If in TIME_WAIT, wait for 2*MSL before fully closing (SHOULD BLOCK)
         if self.state == TCPState.TIME_WAIT:
-            logging.info("In TIME_WAIT, waiting for 2*MSL...")
-            time.sleep(2 * _MSL)
-            self.state = TCPState.CLOSED
-        
+            logging.info("Performing Final Message Reception, Cleanup (FIN_WAIT_2 and TIME_WAIT) - waiting for 2*MSL...")
+            self._time_wait_to_closed()
+
         logging.info("Connection terminated")
 
     def _handle_close_wait(self):
-        """Handle passive close after entering CLOSE_WAIT state."""
+        """
+        Handle passive close after entering CLOSE_WAIT state
+        - EDGE CASE Handler - we rarely are in CLOSE_WAIT when close() is called, since we send our own fin (close() handles sending last data)
+            immediately and move to LAST_ACK
+        """
         logger.info("In CLOSE_WAIT state, sending FIN")
         
         # Send our own FIN
@@ -402,11 +411,10 @@ class TransportSocket:
         self.sock_fd.sendto(syn_packet.encode(), self.conn)
         self.rtt_estimation["timestamps"][initial_seq] = time.time()
         self.state = TCPState.SYN_SENT
-        logger.info(f"Sent SYN packet with initial seq={initial_seq}")
+        timeout = time.time() + _DEFAULT_TIMEOUT
+        logger.info(f"Sent SYN packet with initial seq={initial_seq} (retry in {_DEFAULT_TIMEOUT} seconds)")
         
         # 3. Wait for SYN-ACK
-        timeout = time.time() + _DEFAULT_TIMEOUT * 3  # Longer timeout for initial connection
-
         with self.wait_cond:
             while self.state != TCPState.ESTABLISHED:
                 if time.time() >= timeout:
@@ -556,7 +564,7 @@ class TransportSocket:
 
                 # 3. Evaluate the type of packet received and handle accordingly
 
-                # debug check (TODO: remove)
+                # debug check
                 if packet.flags & FIN_FLAG != 0:
                     logging.debug(f"RECEIVED FIN PACKET, seq={packet.seq}")
                 
@@ -597,7 +605,7 @@ class TransportSocket:
                 elif self.state == TCPState.LAST_ACK and (packet.flags & ACK_FLAG) != 0:
                     # CASE 4: FINISH PASSIVE CLOSE (RECEIVED ACK IN LAST_ACK STATE)
                     with self.recv_lock:
-                        logging.info(f"Received final ACK from {addr}")
+                        logging.info(f"Received final ACK from {addr}, Transitioning to CLOSED")
                         self.state = TCPState.CLOSED
                         self.wait_cond.notify_all()
                     continue
@@ -806,10 +814,10 @@ class TransportSocket:
         For Listener: Receives FIN, ACK and send FIN
         """
         with self.recv_lock:
-            logging.info(f"Received FIN from {addr}, Sending ACK")
+            logging.info(f"(PASSIVE CLOSE) Received FIN from {addr}, Sending ACK")
             self.window["last_ack"] = packet.seq + 1
                         
-                        # Send ACK
+            # Send ACK
             ack_packet = Packet(
                             seq=self.window["next_seq_to_send"], 
                             ack=self.window["last_ack"], 
@@ -817,12 +825,17 @@ class TransportSocket:
                             adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
                         )
             self.sock_fd.sendto(ack_packet.encode(), addr)
-                        
-                        # Transition to CLOSE_WAIT
+
+            # Transition to CLOSE_WAIT
             self.state = TCPState.CLOSE_WAIT
             self.wait_cond.notify_all()
-                        
-                        # Send our own FIN
+
+            # Quick backend check (if close() was called during handle_passive, we already sent our own FIN)
+            if self.state == TCPState.FIN_SENT:
+                self.state = TCPState.LAST_ACK
+                return
+
+            # Send our own FIN
             logging.info(f"Sending FIN request to {addr}")
             fin_packet = Packet(
                             seq=self.window["next_seq_to_send"], 
@@ -841,13 +854,13 @@ class TransportSocket:
         with self.recv_lock:
             logging.info(f"Received ACK for FIN from {addr} (Already sent FIN)")
                         
-                        # Only transition if this is an ACK for our FIN
+            # Only transition if this is an ACK for our FIN
             if packet.ack > self.window["next_seq_expected"]:
                 self.window["next_seq_expected"] = packet.ack
                 self.state = TCPState.TIME_WAIT
                 self.wait_cond.notify_all()
                             
-                            # Schedule transition to CLOSED after 2*MSL
+                # Schedule transition to CLOSED after 2*MSL
                 threading.Timer(2 * _MSL, self._time_wait_to_closed).start()
 
     def _handle_fin_after_fin_sent(self, addr, packet):
@@ -857,7 +870,7 @@ class TransportSocket:
             default timeout to allow for FIN_WAIT_2 handling
         """
         with self.recv_lock:
-            logging.info(f"Received Simultaneous FIN from {addr}")
+            logging.info(f"Received FIN from {addr}")
             self.window["last_ack"] = packet.seq + 1
                         
             # Send ACK
@@ -873,8 +886,3 @@ class TransportSocket:
             logging.info(f"Sent ACK of FIN to {addr}, transitioning to {TCPState.TIME_WAIT} before closing socket")
             self.state = TCPState.TIME_WAIT
             self.wait_cond.notify_all()
-                        
-            # Schedule transition to CLOSED after 2*MSL + 2*DEFAULT_TIMEOUT
-            # wait_time = (2*_MSL) + (2*_DEFAULT_TIMEOUT)
-            # threading.Timer(wait_time, self._time_wait_to_closed).start()
-

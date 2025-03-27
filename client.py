@@ -34,7 +34,6 @@ def client_main():
     print(f"Client: Received data from server:\n{buf[0].decode()}")
 
     # Close the client socket
-    print(f"CALLING CLOSED! Time={time.time()}")
     client_socket.close()
 
 if __name__ == "__main__":
