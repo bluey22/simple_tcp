@@ -98,6 +98,7 @@ class TransportSocket:
         self.death_lock = threading.Lock()
         self.dying = False
         self.thread = None
+        self.resend_timeout_thread = None
 
         # SLiding Window Algorithm Management
         self.window = {
@@ -114,7 +115,7 @@ class TransportSocket:
             "send_buffer": b"",
 
             # Monitoring
-            "in_flight": 0,           # Bytes in flight (sent but not acked)
+            "unacked_bytes": 0,       # Bytes sent but not acked (in flight or lost )
             "peer_adv_window": _MAX_NETWORK_BUFFER,  # Peer's advertised window
         }
 
@@ -144,7 +145,7 @@ class TransportSocket:
             self.sock_fd.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.sock_fd.bind(("", port))
         else:
-            print("Unknown socket type")
+            logging.info("Unknown socket type")
             return EXIT_ERROR
 
         # 1-second timeout so we can periodically check `self.dying`
@@ -156,6 +157,11 @@ class TransportSocket:
         # Start the backend thread
         self.thread = threading.Thread(target=self._backend, daemon=True)
         self.thread.start()
+
+        # Start the send retransmit thread
+        self.resend_timeout_thread = threading.Thread(target=self._monitor_timeouts, daemon=True)
+        self.resend_timeout_thread.start()
+
         return EXIT_SUCCESS
 
     def close(self):
@@ -166,8 +172,10 @@ class TransportSocket:
 
         # Handle connection termination based on the current state
         if self.state == TCPState.ESTABLISHED:
+            logging.debug("Initiated Close")
             self._initiate_close()
         elif self.state == TCPState.CLOSE_WAIT:
+            logging.debug("Passive Close")
             self._handle_close_wait()
         
         # Tell the backend threat to stop
@@ -179,13 +187,17 @@ class TransportSocket:
 
         if self.thread:
             self.thread.join()
+        
+        if self.resend_timeout_thread:
+            self.resend_timeout_thread.join()
 
         if self.sock_fd:
             self.sock_fd.close()
         else:
-            print(str(time.time()), "Error: Null socket")
+            logging.info("Error: Null socket")
             return EXIT_ERROR
 
+        logging.info("close() completed successfully")
         return EXIT_SUCCESS
 
     def send(self, data):
@@ -219,7 +231,7 @@ class TransportSocket:
         read_len = 0
 
         if length < 0:
-            print(str(time.time()), "ERROR: Negative length")
+            logging.error("ERROR: Negative length")
             return EXIT_ERROR
 
         # If blocking read, wait until there's data in buffer
@@ -261,7 +273,7 @@ class TransportSocket:
                             logger.debug(f"Sending window update with adv_window={available_space}")
                             self.sock_fd.sendto(window_update.encode(), self.conn)
             else:
-                print(str(time.time()), "ERROR: Unknown or unimplemented flag.")
+                logging.error("ERROR: Unknown or unimplemented flag.")
                 read_len = EXIT_ERROR
         finally:
             self.recv_lock.release()
@@ -290,7 +302,7 @@ class TransportSocket:
                     logger.warning("Closing with unsent data - connection may be lost")
 
     def _initiate_close(self):
-        print("Initiating connection termination...")
+        logging.info("Initiating connection termination...")
         # 1. Create FIN Packet and send
         fin_packet = Packet(
             seq=self.window["next_seq_to_send"], 
@@ -308,11 +320,13 @@ class TransportSocket:
             while self.state != TCPState.TIME_WAIT and self.state != TCPState.CLOSED:
                 if time.time() >= timeout:
                     # Timeout, retransmit FIN
-                    print(str(time.time()), "FIN timeout, retransmitting...")
-                    self.sock_fd.sendto(fin_packet.encode(), self.conn)
-                    timeout = time.time() + _DEFAULT_TIMEOUT * 4          
+                    logging.info("FIN timeout, retransmitting...")
+                    self.sock_fd.sendto(fin_packet.encode(), self.conn)         
 
                 self.wait_cond.wait(timeout=1.0)
+
+                if time.time() >= timeout + 3:
+                    break
                 
                 # Check if we're dying
                 if self.dying:
@@ -320,11 +334,11 @@ class TransportSocket:
         
         # If in TIME_WAIT, wait for 2*MSL before fully closing
         if self.state == TCPState.TIME_WAIT:
-            print(str(time.time()), "In TIME_WAIT, waiting for 2*MSL...")
+            logging.info("In TIME_WAIT, waiting for 2*MSL...")
             time.sleep(2 * _DEFAULT_TIMEOUT)
             self.state = TCPState.CLOSED
-            
-        print(str(time.time()), "Connection terminated")
+        
+        logging.info("Connection terminated")
 
     def _handle_close_wait(self):
         """Handle passive close after entering CLOSE_WAIT state."""
@@ -396,7 +410,7 @@ class TransportSocket:
             while self.state != TCPState.ESTABLISHED:
                 if time.time() >= timeout:
                     # Timeout, retransmit SYN and reset timeout
-                    print("SYN timeout, retransmitting...")
+                    logging.info("SYN timeout, retransmitting...")
                     self.sock_fd.sendto(syn_packet.encode(), self.conn)
                     timeout = time.time() + _DEFAULT_TIMEOUT * 3
                 
@@ -407,38 +421,44 @@ class TransportSocket:
                 if self.dying:
                     raise ValueError("Socket is closing")
         
-        print(f"{time.time()} Connection established successfully")
+        logging.info(f"{time.time()} Connection established successfully")
 
     def _send_segment(self, data):
         """
-        Send 'data' in multiple MSS-sized segments with flow control
+        Send 'data' in multiple MSS-sized segments and monitor timeouts for resends
+        - Flow Control (Sliding Window w/ Advertised Window and Timeouts)
         """
-        offset = 0
+        # 1. Iterate through data
+        offset = 0  # ptr for byte array data
         total_len = len(data)
-
-        # While there's data left to send
         while offset < total_len:
+
+            # Safely access window with condition lock ("next_seq_to_send")
             with self.wait_cond:
-                # Wait for window space to be available
-                while self.window["in_flight"] >= self.window["peer_adv_window"]:
-                    print(f"Flow control: waiting for window space (in_flight={self.window['in_flight']}, peer_window={self.window['peer_adv_window']})")
+                
+                # 2. Check if there is room to send the data
+                while self.window["unacked_bytes"] >= self.window["peer_adv_window"]:
+                    logging.info(f"WAIT - send(): Waiting for window space")
+                    logging.debug(f"WAIT - send():(unacked_bytes_sent={self.window['unacked_bytes']}, peer_window={self.window['peer_adv_window']})")
+                    # Wait for space to open up
                     self.wait_cond.wait(timeout=0.3)
+
+                    # If shutdown, cancel send()
                     if self.dying:
                         return
                 
-                # Calculate how much we can send now
-                available_window = self.window["peer_adv_window"] - self.window["in_flight"]
+                # 3. Formulate packet with maximum payload_len based on availability
+                available_window = self.window["peer_adv_window"] - self.window["unacked_bytes"]
                 payload_len = min(_MSS, total_len - offset, available_window)
                 
+                # Dont send a segment with 0 bytes
                 if payload_len <= 0:
                     continue
                     
-                # Get sequence number for this segment
                 seq_no = self.window["next_seq_to_send"]
-                chunk = data[offset:offset + payload_len]
+                chunk = data[offset:offset + payload_len]  # Slice of data that was sent
                 
-                # Create and send packet
-                segment = Packet(
+                send_packet = Packet(
                     seq=seq_no, 
                     ack=self.window["last_ack"], 
                     flags=0, 
@@ -446,36 +466,50 @@ class TransportSocket:
                     payload=chunk
                 )
                 
-                print(f"Sending segment (seq={seq_no}, len={payload_len}, window={available_window})")
-                self.sock_fd.sendto(segment.encode(), self.conn)
+                logging.info(f"Sending segment (seq={seq_no}, len={payload_len})")
+                self.sock_fd.sendto(send_packet.encode(), self.conn)
                 
-                # Update window tracking
+                # 4. Update window tracking
                 self.window["next_seq_to_send"] += payload_len
-                self.window["in_flight"] += payload_len
+                self.window["unacked_bytes"] += payload_len
                 self.rtt_estimation["timestamps"][seq_no] = time.time()
-                self.window["packets_in_flight"][seq_no] = (segment, time.time())
+                self.window["packets_in_flight"][seq_no] = (send_packet, time.time())
                 
-                # Check for ACKs on all sent packets
-                # TODO, potentially allow multiple calls to send() without blocks (use send buffer and offset)
-                start_wait = time.time()
-                while seq_no in self.window["packets_in_flight"]:
-                    # Check for timeout and retransmit if needed
-                    current_time = time.time()
-                    if current_time - self.window["packets_in_flight"][seq_no][1] > _DEFAULT_TIMEOUT:
-                        print(f"Timeout: Retransmitting segment (seq={seq_no})")
-                        self.sock_fd.sendto(segment.encode(), self.conn)
-                        self.window["packets_in_flight"][seq_no] = (segment, current_time)
+                # 5. Monitor all sent packets Check for ACKs on all sent packets
+                # start_wait = time.time()
+                # while seq_no in self.window["packets_in_flight"]:
+                #     # 6. Retransmit Timed Out Packets
+                #     current_time = time.time()
+                #     if current_time - self.window["packets_in_flight"][seq_no][1] > _DEFAULT_TIMEOUT:
+                #         logging.info(f"Timeout: Retransmitting segment (seq={seq_no})")
+                #         self.sock_fd.sendto(send_packet.encode(), self.conn)
+                #         self.window["packets_in_flight"][seq_no] = (send_packet, current_time)
+                #     self.wait_cond.wait(timeout=0.2)
                     
-                    # Wait for a short time to check for ACKs
-                    self.wait_cond.wait(timeout=0.1)
-                    
-                    # Give up after reasonable timeout to avoid deadlock
-                    if current_time - start_wait > 10:  # 10 seconds total timeout
-                        print("Giving up on waiting for ACK after 10 seconds")
-                        break
+                #     if current_time - start_wait > _DEFAULT_TIMEOUT * 2: 
+                #         logging.info(f"Difficulty sending packet (seq={seq_no}). Giving up (handle instead with duplicate ACKs)")
+                #         break
                 
-                # Move to next segment
+                # Advance data ptr based on what was sent
                 offset += payload_len
+
+    def _monitor_timeouts(self):
+        """
+        Periodically check for packets in flight that have timed out and retransmit them.
+        This function should be run in a separate thread.
+        """
+        while not self.dying:
+            with self.wait_cond:
+                current_time = time.time()
+                for seq_no, (packet, timestamp) in list(self.window["packets_in_flight"].items()):
+                    if current_time - timestamp > _DEFAULT_TIMEOUT:
+                        logging.info(f"Timeout: Retransmitting segment (seq={seq_no})")
+                        self.sock_fd.sendto(packet.encode(), self.conn)
+                        # Update the timestamp for the retransmitted packet
+                        self.window["packets_in_flight"][seq_no] = (packet, current_time)
+                # Notify any waiting threads that window state may have changed (e.g. if ACKs arrive)
+                self.wait_cond.notify_all()
+            time.sleep(0.5)
 
     # ---------------------------- Connection Control Helpers ------------------------------------
     def _time_wait_to_closed(self):
@@ -531,7 +565,7 @@ class TransportSocket:
                 if self.state == TCPState.LISTEN and (packet.flags & SYN_FLAG) != 0:
                     # Received SYN in LISTEN state
                     with self.recv_lock:
-                        print(f"{time.time()} Received SYN from {addr}")
+                        logging.info(f"{time.time()} Received SYN from {addr}")
                         
                         # SYN consumes one sequence number, so next expected byte is packet.seq + 1
                         self.window["last_ack"] = packet.seq + 1
@@ -562,7 +596,7 @@ class TransportSocket:
                 elif self.state == TCPState.SYN_SENT and (packet.flags & SYN_FLAG) != 0 and (packet.flags & ACK_FLAG) != 0:
                     # Received SYN+ACK in SYN_SENT state
                     with self.recv_lock:
-                        print(f"{time.time()} Received SYN+ACK from {addr}")
+                        logging.info(f"{time.time()} Received SYN+ACK from {addr}")
                         
                         # SYN consumes one sequence number, so next expected byte is packet.seq + 1
                         self.window["last_ack"] = packet.seq + 1
@@ -573,7 +607,8 @@ class TransportSocket:
                         if packet.ack == initial_seq + 1:
                             # Update RTT estimation
                             if initial_seq in self.rtt_estimation["timestamps"]:
-                                self._update_rtt_estimate(initial_seq)
+                                sample_rtt = time.time() - self.rtt_estimation["timestamps"][initial_seq]
+                                self._update_rtt_estimate(sample_rtt)
                             
                             # Send ACK (final handshake step)
                             ack_packet = Packet(
@@ -595,13 +630,13 @@ class TransportSocket:
                             self.state = TCPState.ESTABLISHED
                             self.wait_cond.notify_all()
                         else:
-                            print(f"Invalid ACK: expected {initial_seq + 1}, got {packet.ack}")
+                            logging.info(f"Invalid ACK: expected {initial_seq + 1}, got {packet.ack}")
                     continue
 
                 elif self.state == TCPState.SYN_RCVD and (packet.flags & ACK_FLAG) != 0:
                     # Received ACK in SYN_RCVD state (completing three-way handshake)
                     with self.recv_lock:
-                        print(f"{time.time()} Received ACK from {addr}, handshake complete")
+                        logging.info(f"{time.time()} Received ACK from {addr}, handshake complete")
                         
                         # The client is acknowledging our SYN
                         expected_ack = self.window["send_base"]
@@ -610,17 +645,17 @@ class TransportSocket:
                             self.state = TCPState.ESTABLISHED
                             self.wait_cond.notify_all()
                             
-                            print(f"Window update: base={self.window['send_base']}, next={self.window['send_next']}, " +
+                            logging.info(f"Window update: base={self.window['send_base']}, next={self.window['send_next']}, " +
                                 f"in_flight={len(self.window['packets_in_flight']) if 'packets_in_flight' in self.window else 0}, adv_window={packet.adv_window}")
                         else:
-                            print(f"Invalid ACK: expected {expected_ack}, got {packet.ack}")
+                            logging.info(f"Invalid ACK: expected {expected_ack}, got {packet.ack}")
                     continue
 
                 # Connection termination handling
                 elif self.state == TCPState.ESTABLISHED and (packet.flags & FIN_FLAG) != 0:
                     # Received FIN in ESTABLISHED state (passive close)
                     with self.recv_lock:
-                        print(str(time.time()), f"Received FIN from {addr}")
+                        logging.info(f"Received FIN from {addr}")
                         self.window["last_ack"] = packet.seq + 1
                         
                         # Send ACK
@@ -651,7 +686,7 @@ class TransportSocket:
                 elif self.state == TCPState.FIN_WAIT_1 and (packet.flags & ACK_FLAG) != 0:
                     # Received ACK in FIN_SENT state
                     with self.recv_lock:
-                        print(str(time.time()), f"Received ACK for FIN from {addr}")
+                        logging.info(f"Received ACK for FIN from {addr}")
                         
                         # Only transition if this is an ACK for our FIN
                         if packet.ack > self.window["next_seq_expected"]:
@@ -666,7 +701,7 @@ class TransportSocket:
                 elif self.state == TCPState.FIN_WAIT_2 and (packet.flags & FIN_FLAG) != 0:
                     # Received FIN in FIN_SENT state (simultaneous close)
                     with self.recv_lock:
-                        print(str(time.time()), f"Received FIN from {addr} (simultaneous close)")
+                        logging.info(f"Received FIN from {addr} (simultaneous close)")
                         self.window["last_ack"] = packet.seq + 1
                         
                         # Send ACK
@@ -689,7 +724,7 @@ class TransportSocket:
                 elif self.state == TCPState.LAST_ACK and (packet.flags & ACK_FLAG) != 0:
                     # Received ACK in LAST_ACK state (completing passive close)
                     with self.recv_lock:
-                        print(str(time.time()), f"Received final ACK from {addr}")
+                        logging.info(f"Received final ACK from {addr}")
                         self.state = TCPState.CLOSED
                         self.wait_cond.notify_all()
                     continue
@@ -707,7 +742,7 @@ class TransportSocket:
                             self.window["peer_adv_window"] = packet.adv_window
                             
                             # Update in-flight data count
-                            self.window["in_flight"] = max(0, self.window["in_flight"] - acked_bytes)
+                            self.window["unacked_bytes"] = max(0, self.window["unacked_bytes"] - acked_bytes)
                             
                             # Remove acknowledged packets from in-flight list
                             for seq in list(self.window["packets_in_flight"].keys()):
@@ -715,12 +750,13 @@ class TransportSocket:
                                 if seq + len(pkt.payload) <= packet.ack:
                                     # Update RTT estimation
                                     if seq in self.rtt_estimation["timestamps"]:
-                                        self._update_rtt_estimate(seq)
+                                        sample_rtt = time.time() - self.rtt_estimation["timestamps"][seq]
+                                        self._update_rtt_estimate(sample_rtt)
                                     # Remove from in-flight list
                                     del self.window["packets_in_flight"][seq]
                             
-                            print(f"Window update: base={self.window['next_seq_expected']}, " +
-                                f"in_flight={self.window['in_flight']}, adv_window={packet.adv_window}")
+                            logging.info(f"Window update: base={self.window['next_seq_expected']}, " +
+                                f"in_flight={self.window['unacked_bytes']}, adv_window={packet.adv_window}")
                             
                             # Notify any waiting sender
                             self.wait_cond.notify_all()
@@ -738,7 +774,7 @@ class TransportSocket:
                                 self.window["recv_buf"] += packet.payload
                                 self.window["recv_len"] += len(packet.payload)
                                 
-                                print(f"Received data segment {packet.seq} with {len(packet.payload)} bytes.")
+                                logging.info(f"Received data segment {packet.seq} with {len(packet.payload)} bytes.")
                                 
                                 # Update last_ack
                                 self.window["last_ack"] = packet.seq + len(packet.payload)
@@ -758,7 +794,7 @@ class TransportSocket:
                                 self.wait_cond.notify_all()
                             else:
                                 # Buffer full, send ACK with reduced window
-                                print(f"Receive buffer limited: {available_space} bytes available")
+                                logging.info(f"Receive buffer limited: {available_space} bytes available")
                                 ack_packet = Packet(
                                     seq=self.window["next_seq_to_send"], 
                                     ack=self.window["last_ack"], 
@@ -768,7 +804,7 @@ class TransportSocket:
                                 self.sock_fd.sendto(ack_packet.encode(), addr)
                         elif packet.seq > self.window["last_ack"]:
                             # Out-of-order packet, send duplicate ACK
-                            print(f"Out-of-order packet: received seq={packet.seq}, expected={self.window['last_ack']}")
+                            logging.info(f"Out-of-order packet: received seq={packet.seq}, expected={self.window['last_ack']}")
                             ack_packet = Packet(
                                 seq=self.window["next_seq_to_send"], 
                                 ack=self.window["last_ack"], 
@@ -778,7 +814,7 @@ class TransportSocket:
                             self.sock_fd.sendto(ack_packet.encode(), addr)
                         else:
                             # Duplicate packet, send ACK
-                            print(f"Duplicate packet: received seq={packet.seq}, already received up to={self.window['last_ack']}")
+                            logging.info(f"Duplicate packet: received seq={packet.seq}, already received up to={self.window['last_ack']}")
                             ack_packet = Packet(
                                 seq=self.window["next_seq_to_send"], 
                                 ack=self.window["last_ack"], 
@@ -788,7 +824,7 @@ class TransportSocket:
                             self.sock_fd.sendto(ack_packet.encode(), addr)
                 elif len(packet.payload) > 0:
                     # Out-of-order or duplicate packet
-                    print(str(time.time()), f"Out-of-order packet: seq={packet.seq}, expected={self.window['last_ack']}")
+                    logging.info(f"Out-of-order packet: seq={packet.seq}, expected={self.window['last_ack']}")
                     
                     # Send duplicate ACK
                     ack_packet = Packet(
@@ -804,4 +840,4 @@ class TransportSocket:
             
             except Exception as e:
                 if not self.dying:
-                    print(str(time.time()), f"Error in backend: {e}")
+                    logging.info(f"Error in backend: {e}")
