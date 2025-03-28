@@ -15,7 +15,7 @@ Note: Might need to run more than once for coherence - I've tested in multiple c
             usage of the API (always calling close(), responsible calls to send(), recv())
 3) At the end of the console, you can see the alpha value and the final estimated RTT (you can play around with the _ALPHA parameter at the top of transport.py)
 
-For 2) you can alter network conditions with the following commands:
+For 2) Try running it in perfect conditions. Then, you can alter network conditions with the following commands:
 ```bash
 sudo tc qdisc add dev lo root netem delay 200ms loss 20%
 sudo tc qdisc del dev lo root netem
