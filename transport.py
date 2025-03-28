@@ -222,7 +222,7 @@ class TransportSocket:
         if self.state != TCPState.ESTABLISHED:
             raise ValueError("Connection not in ESTABLISHED state.")
         
-        logging.debug(f"API CALL: send(data) called with data = {data}")
+        logging.debug(f"API CALL: send(data) called")
         with self.send_lock:
             self._send_segment(data)
 
@@ -537,7 +537,7 @@ class TransportSocket:
         logger.debug(f"Updated RTT estimate: {self.rtt_estimation['estimated_rtt']:.3f}s (sample: {sample_rtt:.3f}s)")
         return self.rtt_estimation["estimated_rtt"]
     
-    # ---------------------------- Private backend() helpers ------------------------------------
+    # ---------------------------- Private backend() + helpers ------------------------------------
     def _backend(self):
         """
         Backend loop to handle receiving data and sending acknowledgments.
@@ -610,111 +610,85 @@ class TransportSocket:
                         self.wait_cond.notify_all()
                     continue
 
-                # Data packet handling (ACK packets with or without data)
-                if (packet.flags & ACK_FLAG) != 0:
-                    with self.recv_lock:
-                        # Check if this ACK advances our window
-                        if packet.ack > self.window["next_seq_expected"]:
-                            # Calculate how many bytes were acknowledged
-                            acked_bytes = packet.ack - self.window["next_seq_expected"]
-                            self.window["next_seq_expected"] = packet.ack
+                # 3.3 DATA PACKET HANDLING
+                with self.recv_lock:
+                    incoming_seq = packet.seq
+                    incoming_ack = packet.ack
+
+                    # We split up data handling (or ACK receptions in client-server) into a 2 step process:
+                    #   - 3.3.1 Process Payload Data for our RECV buffers
+                    #   - 3.3.2 Update our window if we received an ACK (no matter what)
+                    
+                    # 3.3.1 Process ACK+payload first if we're in an appropriate state
+                    if self.state in [TCPState.ESTABLISHED, TCPState.CLOSE_WAIT] and len(packet.payload) > 0:
+                        # Case 1: We receive an in-order packet
+                        if incoming_seq == self.window["last_ack"]:
+
+                            # Calculate available space from maximum possible
+                            available_space = _MAX_NETWORK_BUFFER - self.window["recv_len"]
+
+                            # If we have room for the payload, fill the buffer and update
+                            if available_space >= len(packet.payload):
+                                self.window["recv_buf"] += packet.payload
+                                self.window["recv_len"] += len(packet.payload)
+                                logging.info(f"Received data segment {incoming_seq} with {len(packet.payload)} bytes.")
+                                # Update expected receive sequence based solely on payload
+                                self.window["last_ack"] = incoming_seq + len(packet.payload)
                             
-                            # Update peer's advertised window
+                            # Otherwise, do nothing (we'll have a duplicate ack)
+                            else:
+                                logging.info(f"Receive buffer limited: {available_space} bytes available")
+                            
+                            # In either case, send an ACK with the new last_ack value
+                            adv_window = _MAX_NETWORK_BUFFER - self.window["recv_len"]
+                            ack_packet = Packet(
+                                seq=self.window["next_seq_to_send"],
+                                ack=self.window["last_ack"],
+                                flags=ACK_FLAG,
+                                adv_window=adv_window
+                            )
+                            self.sock_fd.sendto(ack_packet.encode(), addr)
+                            self.wait_cond.notify_all()
+                        
+                        # Case 2: We receive an out-of-order packet
+                        elif incoming_seq > self.window["last_ack"]:
+                            logging.info(f"Out-of-order packet: received seq={incoming_seq}, expected={self.window['last_ack']}")
+                            # send duplicate ACK
+                            ack_packet = Packet(
+                                seq=self.window["next_seq_to_send"],
+                                ack=self.window["last_ack"],
+                                flags=ACK_FLAG,
+                                adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
+                            )
+                            self.sock_fd.sendto(ack_packet.encode(), addr)
+                        
+                        # Case 3: We receive a packet we previously ack'ed
+                        else:
+                            logging.info(f"Duplicate packet: received seq={incoming_seq}, already received up to={self.window['last_ack']}")
+                            ack_packet = Packet(
+                                seq=self.window["next_seq_to_send"],
+                                ack=self.window["last_ack"],
+                                flags=ACK_FLAG,
+                                adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
+                            )
+                            self.sock_fd.sendto(ack_packet.encode(), addr)
+
+                    # 3.3.2 Process ACK Information and Advance our window (No matter what the state is)
+                    if (packet.flags & ACK_FLAG) != 0:
+                        if incoming_ack > self.window["next_seq_expected"]:
+                            acked_bytes = incoming_ack - self.window["next_seq_expected"]
+                            self.window["next_seq_expected"] = incoming_ack
                             self.window["peer_adv_window"] = packet.adv_window
-                            
-                            # Update in-flight data count
                             self.window["unacked_bytes"] = max(0, self.window["unacked_bytes"] - acked_bytes)
-                            
-                            # Remove acknowledged packets from in-flight list
                             for seq in list(self.window["packets_in_flight"].keys()):
                                 pkt, _ = self.window["packets_in_flight"][seq]
-                                if seq + len(pkt.payload) <= packet.ack:
-                                    # Update RTT estimation
+                                if seq + len(pkt.payload) <= incoming_ack:
                                     if seq in self.rtt_estimation["timestamps"]:
                                         sample_rtt = time.time() - self.rtt_estimation["timestamps"][seq]
                                         self._update_rtt_estimate(sample_rtt)
-                                    # Remove from in-flight list
                                     del self.window["packets_in_flight"][seq]
-                            
-                            logging.info(f"Window update: base={self.window['next_seq_expected']}, " +
-                                f"in_flight={self.window['unacked_bytes']}, adv_window={packet.adv_window}")
-                            
-                            # Notify any waiting sender
+                            logging.info(f"Window update: base={self.window['next_seq_expected']}, in_flight={self.window['unacked_bytes']}, adv_window={packet.adv_window}")
                             self.wait_cond.notify_all()
-
-                # Data packet processing (if in ESTABLISHED state)
-                if self.state in [TCPState.ESTABLISHED, TCPState.CLOSE_WAIT] and len(packet.payload) > 0:
-                    with self.recv_lock:
-                        # Check if this packet is within our receive window
-                        if packet.seq == self.window["last_ack"]:
-                            # Check if we have space in the receive buffer
-                            available_space = _MAX_NETWORK_BUFFER - self.window["recv_len"]
-                            
-                            if available_space >= len(packet.payload):
-                                # Append payload to our receive buffer
-                                self.window["recv_buf"] += packet.payload
-                                self.window["recv_len"] += len(packet.payload)
-                                
-                                logging.info(f"Received data segment {packet.seq} with {len(packet.payload)} bytes.")
-                                
-                                # Update last_ack
-                                self.window["last_ack"] = packet.seq + len(packet.payload)
-                                
-                                # Calculate new advertised window
-                                adv_window = _MAX_NETWORK_BUFFER - self.window["recv_len"]
-                                
-                                # Send ACK with current window advertisement
-                                ack_packet = Packet(
-                                    seq=self.window["next_seq_to_send"], 
-                                    ack=self.window["last_ack"], 
-                                    flags=ACK_FLAG, 
-                                    adv_window=adv_window
-                                )
-                                self.sock_fd.sendto(ack_packet.encode(), addr)
-                                
-                                self.wait_cond.notify_all()
-                            else:
-                                # Buffer full, send ACK with reduced window
-                                logging.info(f"Receive buffer limited: {available_space} bytes available")
-                                ack_packet = Packet(
-                                    seq=self.window["next_seq_to_send"], 
-                                    ack=self.window["last_ack"], 
-                                    flags=ACK_FLAG, 
-                                    adv_window=available_space
-                                )
-                                self.sock_fd.sendto(ack_packet.encode(), addr)
-                        elif packet.seq > self.window["last_ack"]:
-                            # Out-of-order packet, send duplicate ACK
-                            logging.info(f"Out-of-order packet: received seq={packet.seq}, expected={self.window['last_ack']}")
-                            ack_packet = Packet(
-                                seq=self.window["next_seq_to_send"], 
-                                ack=self.window["last_ack"], 
-                                flags=ACK_FLAG, 
-                                adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
-                            )
-                            self.sock_fd.sendto(ack_packet.encode(), addr)
-                        else:
-                            # Duplicate packet, send ACK
-                            logging.info(f"Duplicate packet: received seq={packet.seq}, already received up to={self.window['last_ack']}")
-                            ack_packet = Packet(
-                                seq=self.window["next_seq_to_send"], 
-                                ack=self.window["last_ack"], 
-                                flags=ACK_FLAG, 
-                                adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
-                            )
-                            self.sock_fd.sendto(ack_packet.encode(), addr)
-                elif len(packet.payload) > 0:
-                    # Out-of-order or duplicate packet
-                    logging.info(f"Out-of-order packet: seq={packet.seq}, expected={self.window['last_ack']}")
-                    
-                    # Send duplicate ACK
-                    ack_packet = Packet(
-                        seq=self.window["next_seq_to_send"], 
-                        ack=self.window["last_ack"], 
-                        flags=ACK_FLAG, 
-                        adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
-                    )
-                    self.sock_fd.sendto(ack_packet.encode(), addr)
 
             except socket.timeout:
                 continue
