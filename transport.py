@@ -115,7 +115,6 @@ class TransportSocket:
             "next_seq_to_send": 0,    # Next sequence number to send to peer
             "send_base": 0,           # Base of sending window (oldest unacked byte)
             "packets_in_flight": {},  # Unacked but Sent {seq: (packet, send_time)}
-            "send_buffer": b"",
 
             # Monitoring
             "unacked_bytes": 0,       # Bytes sent but not acked (in flight or lost )
@@ -202,7 +201,7 @@ class TransportSocket:
             logging.info("Error: Null socket")
             return EXIT_ERROR
 
-        logging.debug(f"Finishing exiting with state = {self.state}")
+        logging.debug(f"Closing with state = {self.state}")
         logging.info("close() completed successfully")
         return EXIT_SUCCESS
 
@@ -218,11 +217,12 @@ class TransportSocket:
         if self.state == TCPState.CLOSED and self.sock_type == "TCP_INITIATOR":
             self._connect()
         
-        # We can all send data in a ESTABLISHED connection state
+        # We can only send data in a ESTABLISHED connection state
         if self.state != TCPState.ESTABLISHED:
-            raise ValueError("Connection not in ESTABLISHED state.")
+            logging.warning("Connection not in ESTABLISHED state. send() not executed")
+            return
         
-        logging.debug(f"API CALL: send(data) called")
+        # logging.debug(f"API CALL: send(data) called")
         with self.send_lock:
             self._send_segment(data)
 
@@ -292,21 +292,23 @@ class TransportSocket:
         """
         Calculated wait that monitors the send_buffer (sent but unacknowledged data)
         """
+        logger.debug("Ensuring sends complete before closing")
         # 1. Acquire send_lock to check the send_buffer
         with self.send_lock:
-            if self.window["send_buffer"]:
+            # Wait until unacked_bytes is zero (or packets_in_flight is empty)
+            if self.window["unacked_bytes"]:
                 logger.info("Waiting for all data to be acknowledged before closing")
                 
                 # 2. Wait loop for acknowledgements
-                deadline = time.time() + 10
-                while self.window["send_buffer"] and time.time() < deadline:
+                deadline = time.time() + (_DEFAULT_TIMEOUT * 2)
+                while self.window["unacked_bytes"] > 0 and time.time() < deadline:
                     self.send_lock.release()
                     time.sleep(0.2)
                     self.send_lock.acquire()
                 
                 # 3. Exit
-                if self.window["send_buffer"]:
-                    logger.warning("Closing with unsent data - connection may be lost")
+                if self.window["unacked_bytes"]:
+                    logger.warning("Closing with unacked sent data - data may be lost")
 
     def _initiate_close(self):
         logging.info("Initiating connection termination...")
@@ -522,7 +524,6 @@ class TransportSocket:
             logger.error(f"Error in TIME_WAIT transition: {e}")
 
     # ---------------------------- Flow Control Helpers ------------------------------------
-
     def _update_rtt_estimate(self, sample_rtt):
         """Update RTT estimation using EWMA algorithm."""
         # EstimatedRTT = alpha × EstimatedRTT + (1 - alpha) × SampleRTT
@@ -595,7 +596,7 @@ class TransportSocket:
                     self._handle_ack_for_fin_initiator(addr, packet)
                     continue
 
-                elif (self.state == TCPState.FIN_SENT or self.state == TCPState.TIME_WAIT) and (packet.flags & FIN_FLAG) != 0:
+                elif (self.state in [TCPState.FIN_SENT, TCPState.TIME_WAIT]) and (packet.flags & FIN_FLAG) != 0:
                     # CASE 3: HANDLING SIMULTANEOUS CLOSE
                     # + EDGE CASE: FIN_WAIT_2 CASE, OUR FIN ACK'ED, BUT WE WANT TO BE SURE TO ACK THEIR FIN WHILE NOT TOTALLY DEAD
                     #   - AKA, Combine FIN_WAIT_2 into TIME_WAIT
@@ -635,11 +636,12 @@ class TransportSocket:
                                 # Update expected receive sequence based solely on payload
                                 self.window["last_ack"] = incoming_seq + len(packet.payload)
                             
-                            # Otherwise, do nothing (we'll have a duplicate ack)
+                            # Otherwise, do nothing (we'll send a duplicate ack)
                             else:
                                 logging.info(f"Receive buffer limited: {available_space} bytes available")
                             
-                            # In either case, send an ACK with the new last_ack value
+                            # In either case (in-order or out-of-order data), send an ACK with the new last_ack value
+                            logging.info(f"Sending ACK of seq={self.window['next_seq_to_send']} and ack={self.window['last_ack']}")
                             adv_window = _MAX_NETWORK_BUFFER - self.window["recv_len"]
                             ack_packet = Packet(
                                 seq=self.window["next_seq_to_send"],
@@ -675,6 +677,7 @@ class TransportSocket:
 
                     # 3.3.2 Process ACK Information and Advance our window (No matter what the state is)
                     if (packet.flags & ACK_FLAG) != 0:
+                        logging.info(f"Received ACK packet! (No Payload) seq={incoming_seq}, ack={incoming_ack}")
                         if incoming_ack > self.window["next_seq_expected"]:
                             acked_bytes = incoming_ack - self.window["next_seq_expected"]
                             self.window["next_seq_expected"] = incoming_ack
