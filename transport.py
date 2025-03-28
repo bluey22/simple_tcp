@@ -266,7 +266,7 @@ class TransportSocket:
                         self.window["recv_buf"] = b""
                         self.window["recv_len"] = 0
                     
-                    # Send window update if we've freed a >quarter of our window with our read
+                    # Send window update if we've freed a >quarter of our window with our read (unreliably)
                     available_space = _MAX_NETWORK_BUFFER - self.window["recv_len"]
                     if (available_space > _MAX_NETWORK_BUFFER / 4):
                         
@@ -324,20 +324,25 @@ class TransportSocket:
         logger.info(f"Sent FIN packet with seq={fin_packet.seq}")
         
         # 2. Wait for ACK or FIN+ACK
-        timeout = time.time() + _DEFAULT_TIMEOUT * 4
+        start_time = time.time()
+        last_send = start_time
         with self.wait_cond:
-            while self.state != TCPState.TIME_WAIT and self.state != TCPState.CLOSED:
-                if time.time() >= timeout:
-                    # Timeout, retransmit FIN
+            while self.state not in (TCPState.TIME_WAIT, TCPState.CLOSED):
+                current_time = time.time()
+                # If 0.5 seconds have passed since the last FIN was sent, retransmit FIN.
+                if current_time - last_send >= 0.5:
                     logging.info("FIN timeout, retransmitting...")
-                    self.sock_fd.sendto(fin_packet.encode(), self.conn)         
-
-                self.wait_cond.wait(timeout=1.0)
-
-                if time.time() >= timeout + 3:
+                    self.sock_fd.sendto(fin_packet.encode(), self.conn)
+                    last_send = current_time
+                
+                # Wait briefly so we don't busy-loop (you can adjust the wait time as needed)
+                self.wait_cond.wait(timeout=0.3)
+                
+                # Break out of the loop after 3 seconds have passed since we started
+                if current_time - start_time >= 3:
                     break
                 
-                # Check if we're dying
+                # Check if we're dying and break out if so.
                 if self.dying:
                     break
         
@@ -370,7 +375,7 @@ class TransportSocket:
         logger.info(f"Sent FIN, moved to LAST_ACK")
         
         # Wait for ACK
-        timeout = time.time() + _DEFAULT_TIMEOUT * 3
+        timeout = time.time() + _DEFAULT_TIMEOUT
         
         with self.wait_cond:
             while self.state != TCPState.CLOSED:
@@ -378,7 +383,7 @@ class TransportSocket:
                     # Timeout, retransmit FIN
                     logger.warning("FIN timeout, retransmitting...")
                     self.sock_fd.sendto(fin_packet.encode(), self.conn)
-                    timeout = time.time() + _DEFAULT_TIMEOUT * 3
+                    timeout = time.time() + _DEFAULT_TIMEOUT
                 
                 # Wait for state change or timeout
                 self.wait_cond.wait(timeout=1.0)
@@ -503,6 +508,9 @@ class TransportSocket:
         dynamic_timeout = 2 * current_rtt_esimation
 
         while not self.dying:
+            if self.state in [TCPState.LAST_ACK, TCPState.TIME_WAIT, TCPState.FIN_SENT]:
+                break
+
             with self.wait_cond:
                 current_time = time.time()
                 for seq_no, (packet, timestamp) in list(self.window["packets_in_flight"].items()):
@@ -574,10 +582,6 @@ class TransportSocket:
                 self.window["peer_adv_window"] = packet.adv_window
 
                 # 3. Evaluate the type of packet received and handle accordingly
-
-                # debug check
-                if packet.flags & FIN_FLAG != 0:
-                    logging.debug(f"RECEIVED FIN PACKET, seq={packet.seq}")
                 
                 # 3.1 CONNECTION ESTABLISHMENT CASES
                 if self.state == TCPState.LISTEN and (packet.flags & SYN_FLAG) != 0:
@@ -650,7 +654,7 @@ class TransportSocket:
                             else:
                                 logging.info(f"Receive buffer limited: {available_space} bytes available")
                             
-                            # In either case (in-order or out-of-order data), send an ACK with the new last_ack value
+                            # In either case (in-order or out-of-order data), send an ACK with the new last_ack value (unreliably)
                             logging.info(f"Sending ACK of seq={self.window['next_seq_to_send']} and ack={self.window['last_ack']}")
                             adv_window = _MAX_NETWORK_BUFFER - self.window["recv_len"]
                             ack_packet = Packet(
@@ -662,7 +666,7 @@ class TransportSocket:
                             self.sock_fd.sendto(ack_packet.encode(), addr)
                             self.wait_cond.notify_all()
                         
-                        # Case 2: We receive an out-of-order packet
+                        # Case 2: We receive an out-of-order packet (unreliably sent)
                         elif incoming_seq > self.window["last_ack"]:
                             logging.info(f"Out-of-order packet: received seq={incoming_seq}, expected={self.window['last_ack']}")
                             # send duplicate ACK
@@ -674,7 +678,7 @@ class TransportSocket:
                             )
                             self.sock_fd.sendto(ack_packet.encode(), addr)
                         
-                        # Case 3: We receive a packet we previously ack'ed
+                        # Case 3: We receive a packet we previously ack'ed (unreliably sent)
                         else:
                             logging.info(f"Duplicate packet: received seq={incoming_seq}, already received up to={self.window['last_ack']}")
                             ack_packet = Packet(
@@ -729,9 +733,9 @@ class TransportSocket:
         For Listener: Receives SYN packet from connection, send back SYN+ACK
         """
         with self.recv_lock:
-            logging.info(f"{time.time()} Received SYN from {addr}, Sending SYN+ACk")
+            logging.info(f"{time.time()} Received SYN from {addr}, Sending SYN+ACK")
             
-            # 1. Advance window
+            # 1. Advance window, expect next byte after SYN
             self.window["last_ack"] = packet.seq + 1
                         
             # 2. Select starting sequence # and send SYN+ACK
@@ -742,7 +746,12 @@ class TransportSocket:
                             flags=SYN_FLAG | ACK_FLAG, 
                             adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
                         )
+            # Send the SYN+ACK
             self.sock_fd.sendto(syn_ack.encode(), addr)
+
+            # 3. Add the SYN+ACK to our tracking so that it gets retransmitted if needed
+            self.window["packets_in_flight"][initial_seq] = (syn_ack, time.time())
+            self.rtt_estimation["timestamps"][initial_seq] = time.time()
                         
             # Update our sequence numbers
             self.window["next_seq_to_send"] = initial_seq + 1
@@ -786,6 +795,10 @@ class TransportSocket:
                 self.window["next_seq_expected"] = packet.ack
                 self.window["send_base"] = packet.ack
                 self.window["send_next"] = packet.ack
+
+                self.window["packets_in_flight"][initial_seq] = (ack_packet, time.time())
+                self.rtt_estimation["timestamps"][initial_seq] = time.time()
+                        
                             
                 # Transition to ESTABLISHED
                 self.state = TCPState.ESTABLISHED
@@ -815,7 +828,7 @@ class TransportSocket:
         For Listener: Receives FIN, ACK and send FIN
         """
         with self.recv_lock:
-            logging.info(f"(PASSIVE CLOSE) Received FIN from {addr}, Sending ACK")
+            logging.info(f"(PASSIVE CLOSE) Received FIN from {addr} with seq={packet.seq}. Sending ACK")
             self.window["last_ack"] = packet.seq + 1
                         
             # Send ACK
@@ -866,7 +879,9 @@ class TransportSocket:
 
     def _handle_fin_after_fin_sent(self, addr, packet):
         """
-        For Initiator or Receiver: We deal with a simultaneous FIN and or a FIN reception after a ACK of our FIN
+        FIN Received, send ack
+
+        For Initiator or Receiver: We deal with a simultaneous (maybe) FIN and or a FIN reception after a ACK of our FIN
             - We combine FIN_WAIT_2 scenario into our _TIME_WAIT, and increase the wait time by a factor of the
             default timeout to allow for FIN_WAIT_2 handling
         """

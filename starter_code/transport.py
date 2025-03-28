@@ -1,4 +1,4 @@
-# transport.py - starter code version, untouched
+# transport.py - starter code version, unedited (Please See transport.py in the main folder)
 import socket
 import struct
 import threading
