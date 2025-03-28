@@ -493,16 +493,26 @@ class TransportSocket:
         """
         Periodically check for packets in flight that have timed out and retransmit them.
         This function should be run in a separate thread.
+
+        This function also dynamically updates the retransmission timeout based on the rtt_estimation
+        (timeout = 2 *estimatedRTT)
         """
+        with self.recv_lock:
+            current_rtt_esimation = self.rtt_estimation["estimated_rtt"]
+
+        dynamic_timeout = 2 * current_rtt_esimation
+
         while not self.dying:
             with self.wait_cond:
                 current_time = time.time()
                 for seq_no, (packet, timestamp) in list(self.window["packets_in_flight"].items()):
-                    if current_time - timestamp > _DEFAULT_TIMEOUT:
+                    if current_time - timestamp > dynamic_timeout:
                         logging.info(f"Timeout: Retransmitting segment (seq={seq_no})")
                         self.sock_fd.sendto(packet.encode(), self.conn)
+                        
                         # Update the timestamp for the retransmitted packet
                         self.window["packets_in_flight"][seq_no] = (packet, current_time)
+
                 # Notify any waiting threads that window state may have changed (e.g. if ACKs arrive)
                 self.wait_cond.notify_all()
             time.sleep(0.5)
@@ -677,19 +687,33 @@ class TransportSocket:
 
                     # 3.3.2 Process ACK Information and Advance our window (No matter what the state is)
                     if (packet.flags & ACK_FLAG) != 0:
-                        logging.info(f"Received ACK packet! (No Payload) seq={incoming_seq}, ack={incoming_ack}")
+                        logging.info(f"Received ACK packet! (no payload/not in normal receiving state) \n\t - Packet Data: seq={incoming_seq}, ack={incoming_ack}")
+                        
+                        # Check if ACK number advances our window (trust sender)
                         if incoming_ack > self.window["next_seq_expected"]:
+
+                            # Calculate how many bytes have been acknowledged cummulatively
                             acked_bytes = incoming_ack - self.window["next_seq_expected"]
+
+                            # Update window accordingly
                             self.window["next_seq_expected"] = incoming_ack
                             self.window["peer_adv_window"] = packet.adv_window
                             self.window["unacked_bytes"] = max(0, self.window["unacked_bytes"] - acked_bytes)
+
+                            # Remove packets_in_flight if this ACK covers them
                             for seq in list(self.window["packets_in_flight"].keys()):
                                 pkt, _ = self.window["packets_in_flight"][seq]
+
+                                # incoming_ack covers this packet, no longer need to check it for resends
                                 if seq + len(pkt.payload) <= incoming_ack:
+
+                                    # if we ack a packet, we can use it to update our RTT as it's a new sample_rtt
+                                    #   - this update was manually triggered for SYN, here is it's more general use
                                     if seq in self.rtt_estimation["timestamps"]:
                                         sample_rtt = time.time() - self.rtt_estimation["timestamps"][seq]
                                         self._update_rtt_estimate(sample_rtt)
                                     del self.window["packets_in_flight"][seq]
+
                             logging.info(f"Window update: base={self.window['next_seq_expected']}, in_flight={self.window['unacked_bytes']}, adv_window={packet.adv_window}")
                             self.wait_cond.notify_all()
 
