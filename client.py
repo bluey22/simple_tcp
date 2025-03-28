@@ -16,19 +16,11 @@ def client_main():
     client_socket.socket(sock_type="TCP_INITIATOR", port=54321, server_ip="127.0.0.1")
 
     # Send a file to the server
-    # file_name = "alice.txt"
-    # with open(file_name, "rb") as f:
-    #     file_data = f.read()
-    #     print(f"Client: Sending file '{file_name}' to the server...")
-    #     client_socket.send(file_data)
-    
-    # FOR FUN: Try sending line by line (Will error if server )
-    # file_name = "alice.txt"
-    # with open(file_name, "rb") as f:
-    #     for line in f:
-    #         print(f"Client: Sending line: {line.strip().decode(errors='replace')}")
-    #         client_socket.send(line)
-
+    file_name = "alice.txt"
+    with open(file_name, "rb") as f:
+        file_data = f.read()
+        print(f"Client: Sending file '{file_name}' to the server...")
+        client_socket.send(file_data)
 
     # Send randomly generated data to the server
     random_data = generate_random_data(128)
