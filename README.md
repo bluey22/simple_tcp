@@ -1,5 +1,5 @@
 # simple_tcp
-Implements a simplified for TCP with custom header packet headers, and flow/congestion control.
+Implements TCP over UDP with custom header packet headers, sliding window algorithm, flow controw, and (soon) congestion control.
 
 - Project 3 for CSDS 325: Networks
 - @bluey22
