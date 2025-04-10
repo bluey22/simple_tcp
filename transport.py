@@ -17,6 +17,11 @@ _MAX_NETWORK_BUFFER = MAX_NETWORK_BUFFER  # Maximum network buffer size (64KB)
 _MSL = 4.0     # Maximum segment lifetime (4.0s for testing, recommended: 120s)
 _ALPHA = 0.125  # For RTT Estimation (Smoothing Factor)
 
+# New Congestion Avoidance Parameters
+_WINDOW_SIZE = WINDOW_SIZE  # Sliding window size (32 packets) - Limit now explicitly used, in Part 1 was based on max network buffer (adv window)
+_WINDOW_INITIAL_WINDOW_SIZE = WINDOW_INITIAL_WINDOW_SIZE # Initial congestion window size
+_WINDOW_INITIAL_SSTHRESH = WINDOW_INITIAL_SSTHRESH  # Initial slow start threshold
+
 # Setup logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -61,6 +66,11 @@ class TCPState(Enum):
     LAST_ACK = 8        # Receiver sent FIN, waiting for final ACK
 
 
+class CongestionState(Enum):
+    SLOW_START = 0  # Exponential CWND increase
+    CONGESTION_AVOIDANCE = 1  # Linear CWND increase
+
+
 class Packet:
     def __init__(self, seq=0, ack=0, flags=0, adv_window=MAX_NETWORK_BUFFER, payload=b""):
         self.seq = seq
@@ -103,7 +113,7 @@ class TransportSocket:
         self.thread = None
         self.resend_timeout_thread = None
 
-        # SLiding Window Algorithm Management
+        # Sliding Window Algorithm Management
         self.window = {
             # Receiving
             "last_ack": 0,    # The next seq we expect from peer (used for receiving data)
@@ -128,6 +138,13 @@ class TransportSocket:
             "last_sample": None,      # Last RTT sample
             "timestamps": {},          # Timestamp when a segment was sent
             #   - { key: seq#, val: time.time() }
+        }
+
+        # Congestion Control (protected by existing locks)
+        self.congestion_control = {
+            "cwnd": _WINDOW_INITIAL_WINDOW_SIZE,
+            "ssthresh": _WINDOW_INITIAL_SSTHRESH,
+            "state": CongestionState.SLOW_START
         }
 
     # ---------------------------- Public API Methods ------------------------------------
@@ -442,6 +459,12 @@ class TransportSocket:
             "peer_adv_window": _MAX_NETWORK_BUFFER,
         }
 
+        self.congestion_control = {
+            "cwnd": _WINDOW_INITIAL_WINDOW_SIZE,
+            "ssthresh": _WINDOW_INITIAL_SSTHRESH,
+            "state": CongestionState.SLOW_START
+        }
+
         # 1. Initiator formulates SYN/request packet
         initial_seq = random.randint(0, MAX_NETWORK_BUFFER // 2)
         self.window["next_seq_to_send"] = initial_seq
@@ -482,6 +505,7 @@ class TransportSocket:
         """
         Send 'data' in multiple MSS-sized segments and monitor timeouts for resends
         - Flow Control (Sliding Window w/ Advertised Window and Timeouts)
+        - Congestion control - Amount to send limited by CWND (async wait)
         """
         # 1. Iterate through data
         offset = 0  # ptr for byte array data
@@ -492,9 +516,14 @@ class TransportSocket:
             with self.wait_cond:
                 
                 # 2. Check if there is room to send the data
-                while self.window["unacked_bytes"] >= self.window["peer_adv_window"]:
+                # Use the minimum of congestion window and advertised window
+                effective_window = min(
+                    self.congestion_control["cwnd"], self.window["peer_adv_window"]
+                )
+
+                while self.window["unacked_bytes"] >= effective_window:
                     logging.info(f"WAIT - send(): Waiting for window space")
-                    logging.debug(f"WAIT - send():(unacked_bytes_sent={self.window['unacked_bytes']}, peer_window={self.window['peer_adv_window']})")
+                    logging.debug(f"WAIT - send():(unacked_bytes_sent={self.window['unacked_bytes']}, cwnd={self.congestion_control['cwnd']}, peer_window={self.window['peer_adv_window']})")
                     # Wait for space to open up
                     self.wait_cond.wait(timeout=0.3)
 
@@ -502,8 +531,8 @@ class TransportSocket:
                     if self.dying:
                         return
                 
-                # 3. Formulate packet with maximum payload_len based on availability
-                available_window = self.window["peer_adv_window"] - self.window["unacked_bytes"]
+                # 3. Formulate packet with maximum payload_len based on availability (Effective Window may have changed)
+                available_window = min(self.congestion_control["cwnd"], self.window["peer_adv_window"]) - self.window["unacked_bytes"]
                 payload_len = min(_MSS, total_len - offset, available_window)
                 
                 # Dont send a segment with 0 bytes
@@ -517,11 +546,11 @@ class TransportSocket:
                     seq=seq_no, 
                     ack=self.window["last_ack"], 
                     flags=0, 
-                    adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"],
+                    adv_window=_MAX_NETWORK_BUFFER - self.window["recv_len"],
                     payload=chunk
                 )
                 
-                logging.info(f"Sending segment (seq={seq_no}, len={payload_len})")
+                logging.info(f"Sending segment (seq={seq_no}, len={payload_len}), cwnd={self.congestion_control['cwnd']}, ssthresh={self.congestion_control['ssthresh']}")
                 self.sock_fd.sendto(send_packet.encode(), self.conn)
                 
                 # 4. Update window tracking
