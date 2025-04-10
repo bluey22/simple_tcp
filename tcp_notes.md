@@ -199,6 +199,22 @@ EstimatedRTT = alpha * EstimatedRTT + (1 - alpha) * SampleRTT
 TimeOut = 2 * EstimatedRTT
 ```
 
+# Congestion Control
+General Idea: 
+- Senders increase their sending rate until packet loss occurs, then decrease on loss event
+
+For our project, we'll cut to 1 MSS when loss is detected by timeout (TCP Tahoe). Our sending rate is managed by a Congestion Window (`cwnd`), which begins at 1 MSS and determines how much data you can send into the network before waiting for an acknowledgment (ACK).
+
+## Slow Start
+When a connection begins, we increase our sending rate exponentially until the first loss event. Initially `cwnd` = 1 MSS, and then it doubles every RTT (for every ACK, we incremend our CWND by 1 MSS). 
+- This is implemented with the variable/value `ssthresh`, which is set to half of the `cwnd` just before the loss event occured. 
+
+We switch from linear growth once `cwnd` gets to half of its value before timeout. This is achieved by increasing the `cwnd` by `MSS^2 / cwnd` on receiving an ACK.
+
+# Buffer Control
+In terms of Read operations, we limit the total amount of data buffered for the application (unread data, both ordered and unordered bytes) to be less than a `MAX_NETWORK_BUFFER` variable. However, in this simple TCP implementation, we don't buffer out of order data (just send a duplicate ACK). But just a note of what that `MAX_NETWORK_BUFFER` parameter means.
+
+
 ### Sources (for information and images)
 - https://book.systemsapproach.org/e2e/tcp.html#state-transition-diagram
 - https://www.geeksforgeeks.org/tcp-connection-termination/
