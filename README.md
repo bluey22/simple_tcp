@@ -27,11 +27,11 @@ Note: Might need to run more than once for coherence - I've tested in multiple c
 
 For 2) Try running it in perfect conditions. Then, you can alter network conditions with the following commands:
 ```bash
-sudo tc qdisc add dev lo root netem delay 200ms loss 20%
+sudo tc qdisc add dev lo root netem delay 200ms loss 10%
 sudo tc qdisc del dev lo root netem
 ```
     - This will allow you to see retransmits and more interesting happenings
-    - WIll also change the RTT estimations
+    - Will also change the RTT estimations
 
 # Visualize RTT, Throughput, and Congestion Control
 1) Complete the setup in Project Setup
