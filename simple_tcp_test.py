@@ -1,13 +1,10 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import time
-import socket
 import threading
 import random
 import logging
-import os
-import sys
-from transport import TransportSocket, ReadMode, TCPState  # Import from your file
+from transport import TransportSocket, ReadMode
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -15,12 +12,12 @@ logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 # Constants
-TEST_DATA_SIZE = 500  # Size of data to transfer
+TEST_DATA_SIZE = 500   # Size of data to transfer
 SEND_CHUNK_SIZE = 100  # Size of chunks to send at once
 TEST_DURATION = 2      # Total test duration in seconds (Hopefully)
 PORT = 12345
 
-# Class to collect and store metrics
+# MetricsCollector - Reaches into TransportSocket for logging
 class MetricsCollector:
     def __init__(self):
         self.rtt_values = []
@@ -69,7 +66,7 @@ class MetricsCollector:
         if len(self.time_values) % 10 == 0:  # Log every 10th sample to reduce noise
             logger.info(f"Time: {elapsed:.2f}s, RTT: {rtt:.4f}s, Throughput: {throughput/1000:.2f} KB/s, CWND: {cwnd}")
 
-# Server function
+# Simple Server
 def server_function(metrics_collector):
     server = TransportSocket()
     result = server.socket("TCP_LISTENER", PORT)
@@ -80,7 +77,7 @@ def server_function(metrics_collector):
     logger.info(f"Server started on port {PORT}")
     
     # Wait for data
-    buf = [None]  # Wrapper to store received data
+    buf = [None]
     total_received = 0
     
     while True:
@@ -99,14 +96,14 @@ def server_function(metrics_collector):
             logger.info(f"Test duration reached, closing server after {current_time - metrics_collector.start_time:.2f}s")
             break
             
-        # Small delay to avoid busy waiting
+        # Avoid busy waiting
         time.sleep(0.2)
     
     # Close connection
     server.close()
     logger.info(f"Server received {total_received} bytes in total")
 
-# Client function
+# Simple Client
 def client_function(metrics_collector, condition_name):
     client = TransportSocket()
     result = client.socket("TCP_INITIATOR", PORT, "127.0.0.1")
