@@ -140,7 +140,7 @@ class TransportSocket:
             #   - { key: seq#, val: time.time() }
         }
 
-        # Congestion Control (protected by existing locks)
+        # Congestion Control (protected by recv_lock)
         self.congestion_control = {
             "cwnd": _WINDOW_INITIAL_WINDOW_SIZE,
             "ssthresh": _WINDOW_INITIAL_SSTHRESH,
@@ -518,7 +518,7 @@ class TransportSocket:
                 # 2. Check if there is room to send the data
                 # Use the minimum of congestion window and advertised window
                 effective_window = min(
-                    self.congestion_control["cwnd"], self.window["peer_adv_window"]
+                    _WINDOW_SIZE, self.congestion_control["cwnd"], self.window["peer_adv_window"]
                 )
 
                 while self.window["unacked_bytes"] >= effective_window:
@@ -532,7 +532,7 @@ class TransportSocket:
                         return
                 
                 # 3. Formulate packet with maximum payload_len based on availability (Effective Window may have changed)
-                available_window = min(self.congestion_control["cwnd"], self.window["peer_adv_window"]) - self.window["unacked_bytes"]
+                available_window = min(_WINDOW_SIZE, self.congestion_control["cwnd"], self.window["peer_adv_window"]) - self.window["unacked_bytes"]
                 payload_len = min(_MSS, total_len - offset, available_window)
                 
                 # Dont send a segment with 0 bytes
@@ -609,6 +609,8 @@ class TransportSocket:
         Helper method called by _backend() (Case 3.3.2) to update
         congestion control parameters on a successful ACK.
         - Implements slow start and congestion avoidance
+
+        - Called within _backend(), so we have the recv_lock for processing ACKs
         """
         if self.congestion_control["state"] == CongestionState.SLOW_START:
             # 1. In slow start, increase cwnd by MSS for each ACK
@@ -629,6 +631,8 @@ class TransportSocket:
         """
         Helper method called by _monitor_timeouts() to update
         congestion control parameters on a timeout (packet loss detected).
+
+        - Called in _monitor_timeouts(), so we have the wait_cond / recv_lock
         """
         # 1. Set ssthresh to half of the current window
         self.congestion_control["ssthresh"] = max(_MSS, self.congestion_control["cwnd"] // 2)
@@ -777,7 +781,7 @@ class TransportSocket:
                                 # Update expected receive sequence based solely on payload
                                 self.window["last_ack"] = incoming_seq + len(packet.payload)
                             
-                            # Otherwise, do nothing (we'll send a duplicate ack)
+                            # Otherwise, do nothing (we'll send a duplicate ack after a timeout)
                             else:
                                 logging.info(f"Receive buffer limited: {available_space} bytes available")
                             
