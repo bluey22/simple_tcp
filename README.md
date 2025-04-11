@@ -34,6 +34,8 @@ sudo tc qdisc del dev lo root netem
     - Will also change the RTT estimations
 
 # Visualize RTT, Throughput, and Congestion Control
+Please tcp_performance_big_ssthresh.png and tcp_performance_small_ssthresh.png (linear growth) below for example outputs:
+
 1) Complete the setup in Project Setup
 2) Run simple_tcp_test.py and follow the console instructions
     - IMPORTANT: You'll have to hit enter 3 times to advance (it will prompt you, but may disappear). 1 For start, 2 for loss conditions, 3 for results. If the terminal hangs, try enter before retrying or ctrl + c. You will get prompted, this is just a reminder if it disappears from the console, so please be patient (sorry)
@@ -51,6 +53,10 @@ sudo tc qdisc del dev lo root netem
 ```
 
 Please see [TCP Notes](tcp_notes.md) for further information about TCP that I used to build this.
+
+# RTT, Throughput, and CWND monitoring (recording jumps the peaks, have to fix)
+<img src="./tcp_performance_big_ssthresh.png" alt="Connection Termination Interaction Diagram" width="400"/>
+<img src="./tcp_performance_small_ssthresh.png" alt="Connection Termination Interaction Diagram" width="400"/>
 
 # Complete TCP State Machine
 <img src="./images/tcp_state_diagram.png" alt="TCP State Diagram" width="400"/>
