@@ -16,7 +16,7 @@ pip install r requirements.txt
 ```
 
 # HOW TO RUN
-Note: Might need to run more than once for coherence - I've tested in multiple conditions and was able to get solid results every time, but just a warning.
+Note: Might need to run more than once for coherence - I've tested in multiple conditions and was able to get solid results (most of the time), but just a warning.
 1) Open up two terminals
 2) run server.py in one, and client.py in the other. You can observe the console outputs directly or use wireshark (see tcp_over_udp.lua)
     - Sometimes you'll see the randomly generated data in the client and/or server, sometimes you won't
@@ -27,7 +27,7 @@ Note: Might need to run more than once for coherence - I've tested in multiple c
 
 For 2) Try running it in perfect conditions. Then, you can alter network conditions with the following commands:
 ```bash
-sudo tc qdisc add dev lo root netem delay 200ms loss 10%
+sudo tc qdisc add dev lo root netem delay 100ms loss 10%
 sudo tc qdisc del dev lo root netem
 ```
     - This will allow you to see retransmits and more interesting happenings
