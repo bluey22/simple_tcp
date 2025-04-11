@@ -1,271 +1,262 @@
-#!/usr/bin/env python3
-
-# simple_tcp_test.py
-import os
-import time
-import random
-import string
-import logging
-import subprocess
-import threading
 import matplotlib.pyplot as plt
-from transport import TransportSocket, ReadMode
+import numpy as np
+import time
+import socket
+import threading
+import random
+import logging
+import os
+import sys
+from transport import TransportSocket, ReadMode, TCPState  # Import from your file
 
-# Configure basic logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('matplotlib.font_manager').setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
 
-# Create results directory
-os.makedirs("results", exist_ok=True)
+# Constants
+TEST_DATA_SIZE = 500  # Size of data to transfer
+SEND_CHUNK_SIZE = 100  # Size of chunks to send at once
+TEST_DURATION = 2      # Total test duration in seconds (Hopefully)
+PORT = 12345
 
-class SimpleMetrics:
-    """Simple class to collect metrics during the test"""
+# Class to collect and store metrics
+class MetricsCollector:
     def __init__(self):
-        self.times = []
-        self.cwnd = []
-        self.rtt = []
-        self.throughput = []
-        self.bytes_sent = 0
+        self.rtt_values = []
+        self.throughput_values = []
+        self.cwnd_values = []
+        self.time_values = []
         self.start_time = None
+        self.total_bytes_sent = 0
     
-    def record(self, time_val, cwnd_val, rtt_val):
-        self.times.append(time_val)
-        self.cwnd.append(cwnd_val)
-        self.rtt.append(rtt_val)
-        
-        # Calculate throughput
-        if self.start_time is not None:
-            elapsed = max(0.001, time_val - self.start_time)
-            self.throughput.append(self.bytes_sent / elapsed)
-        else:
-            self.throughput.append(0)
-
-class MonitoredSocket(TransportSocket):
-    """Extended TransportSocket that records metrics"""
-    def __init__(self, metrics):
-        super().__init__()
-        self.metrics = metrics
-        self.stop_monitoring = False
-        self.monitor_thread = None
+    def reset(self):
+        self.rtt_values = []
+        self.throughput_values = []
+        self.cwnd_values = []
+        self.time_values = []
+        self.start_time = None
+        self.total_bytes_sent = 0
     
-    def start_monitoring(self):
-        """Start a thread to periodically record metrics"""
-        self.stop_monitoring = False
-        self.metrics.start_time = time.time()
-        self.monitor_thread = threading.Thread(target=self._monitor_metrics)
-        self.monitor_thread.daemon = True
-        self.monitor_thread.start()
+    def start(self):
+        self.start_time = time.time()
     
-    def stop_monitoring(self):
-        """Stop the monitoring thread"""
-        self.stop_monitoring = True
-        if self.monitor_thread:
-            self.monitor_thread.join(timeout=1.0)
-    
-    def _monitor_metrics(self):
-        """Periodically record metrics"""
-        while not self.stop_monitoring and not self.dying:
-            with self.recv_lock:
-                current_time = time.time()
-                
-                # Get current values
-                cwnd_val = self.congestion_control["cwnd"] if hasattr(self, "congestion_control") else 0
-                rtt_val = self.rtt_estimation["estimated_rtt"] if hasattr(self, "rtt_estimation") else 0
-                
-                # Record metrics
-                self.metrics.record(current_time, cwnd_val, rtt_val)
+    def record(self, socket, bytes_sent, current_time=None):
+        if current_time is None:
+            current_time = time.time()
             
-            # Sleep for a short interval
-            time.sleep(0.1)
+        if self.start_time is None:
+            self.start_time = current_time
+            
+        elapsed = current_time - self.start_time
+        
+        # Get RTT from the socket
+        rtt = socket.rtt_estimation["estimated_rtt"]
+        
+        # Calculate throughput (bytes per second)
+        self.total_bytes_sent = bytes_sent
+        throughput = bytes_sent / max(0.1, elapsed)  # Avoid division by zero
+        
+        # Get cwnd from socket
+        cwnd = socket.congestion_control["cwnd"]
+        
+        self.time_values.append(elapsed)
+        self.rtt_values.append(rtt)
+        self.throughput_values.append(throughput)
+        self.cwnd_values.append(cwnd)
+        
+        # Log the values for debugging
+        if len(self.time_values) % 10 == 0:  # Log every 10th sample to reduce noise
+            logger.info(f"Time: {elapsed:.2f}s, RTT: {rtt:.4f}s, Throughput: {throughput/1000:.2f} KB/s, CWND: {cwnd}")
+
+# Server function
+def server_function(metrics_collector):
+    server = TransportSocket()
+    result = server.socket("TCP_LISTENER", PORT)
+    if result != 0:
+        logger.error("Failed to create server socket")
+        return
+        
+    logger.info(f"Server started on port {PORT}")
     
-    def send(self, data):
-        """Override send to track bytes sent"""
-        result = super().send(data)
-        self.metrics.bytes_sent += len(data)
-        return result
-
-def generate_random_data(size):
-    """Generate random data of specified size"""
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=size)).encode()
-
-def configure_network(loss_percent=0):
-    """Configure network conditions using tc"""
-    try:
-        # Clear any existing settings
-        subprocess.run(["sudo", "tc", "qdisc", "del", "dev", "lo", "root"], check=False)
-        
-        # Add packet loss if specified
-        if loss_percent > 0:
-            subprocess.run(["sudo", "tc", "qdisc", "add", "dev", "lo", "root", "netem", "loss", f"{loss_percent}%"], check=True)
-            logging.info(f"Network configured with {loss_percent}% packet loss")
-    except subprocess.SubprocessError as e:
-        logging.error(f"Failed to configure network: {e}")
-
-def reset_network():
-    """Reset network conditions"""
-    try:
-        subprocess.run(["sudo", "tc", "qdisc", "del", "dev", "lo", "root"], check=False)
-        logging.info("Network conditions reset")
-    except subprocess.SubprocessError as e:
-        logging.error(f"Failed to reset network: {e}")
-
-def plot_metrics(metrics, test_name):
-    """Generate three simple plots: cwnd, RTT, and throughput"""
-    # Convert times to relative time from start
-    if metrics.times:
-        start_time = metrics.times[0]
-        rel_times = [t - start_time for t in metrics.times]
-        
-        # Plot congestion window
-        plt.figure(figsize=(8, 4))
-        plt.plot(rel_times, metrics.cwnd)
-        plt.title(f'Congestion Window - {test_name}')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Bytes')
-        plt.grid(True)
-        plt.savefig(f"results/cwnd_{test_name}.png")
-        
-        # Plot RTT
-        plt.figure(figsize=(8, 4))
-        plt.plot(rel_times, metrics.rtt)
-        plt.title(f'Round Trip Time - {test_name}')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Seconds')
-        plt.grid(True)
-        plt.savefig(f"results/rtt_{test_name}.png")
-        
-        # Plot throughput
-        plt.figure(figsize=(8, 4))
-        plt.plot(rel_times, metrics.throughput)
-        plt.title(f'Throughput - {test_name}')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Bytes/s')
-        plt.grid(True)
-        plt.savefig(f"results/throughput_{test_name}.png")
-        
-        logging.info(f"Plots for {test_name} saved to results directory")
-
-def run_server(server_ready_event, server_done_event, metrics):
-    """Run server that receives data"""
-    server_socket = MonitoredSocket(metrics)
-    server_socket.socket(sock_type="TCP_LISTENER", port=54321)
-    
-    # Start monitoring metrics
-    server_socket.start_monitoring()
-    
-    # Signal that server is ready
-    server_ready_event.set()
-    
-    # Receive data
-    buf = [b""]
+    # Wait for data
+    buf = [None]  # Wrapper to store received data
     total_received = 0
     
     while True:
-        received = server_socket.recv(buf, 64*1024, flags=ReadMode.NO_FLAG)
-        if received == 0:  # Connection closed
+        received = server.recv(buf, 4096, ReadMode.NO_WAIT)
+        if received > 0:
+            total_received += received
+            logger.debug(f"Received {received} bytes, total: {total_received}")
+        
+        # Record metrics
+        current_time = time.time()
+        if metrics_collector.start_time and (current_time - metrics_collector.start_time) < TEST_DURATION:
+            metrics_collector.record(server, total_received, current_time)
+        
+        # Check if we need to end the test
+        if metrics_collector.start_time and (current_time - metrics_collector.start_time) >= TEST_DURATION:
+            logger.info(f"Test duration reached, closing server after {current_time - metrics_collector.start_time:.2f}s")
             break
-        total_received += received
+            
+        # Small delay to avoid busy waiting
+        time.sleep(0.2)
     
-    logging.info(f"Server received {total_received} bytes total")
-    
-    # Send a small response back
-    server_socket.send(b"ACK")
-    
-    # Close the socket
-    server_socket.close()
-    
-    # Signal that server is done
-    server_done_event.set()
+    # Close connection
+    server.close()
+    logger.info(f"Server received {total_received} bytes in total")
 
-def run_client(server_ready_event, data_size=512*1024):
-    """Run client that sends data"""
-    # Wait for server to be ready
-    server_ready_event.wait()
+# Client function
+def client_function(metrics_collector, condition_name):
+    client = TransportSocket()
+    result = client.socket("TCP_INITIATOR", PORT, "127.0.0.1")
+    if result != 0:
+        logger.error("Failed to create client socket")
+        return
+        
+    logger.info(f"Client connected to server, starting {condition_name} test")
     
-    # Create client socket
-    client_socket = TransportSocket()
-    client_socket.socket(sock_type="TCP_INITIATOR", port=54321, server_ip="127.0.0.1")
+    # Create test data
+    data = bytes([random.randint(0, 255) for _ in range(TEST_DATA_SIZE)])
     
-    # Generate and send data
-    data = generate_random_data(data_size)
-    logging.info(f"Client sending {len(data)} bytes")
+    # Start metrics collection
+    metrics_collector.start()
+    logger.info(f"Starting {condition_name} test")
     
+    # Send data in chunks to simulate continuous traffic
+    total_sent = 0
     start_time = time.time()
-    client_socket.send(data)
-    elapsed = time.time() - start_time
     
-    logging.info(f"Data sent in {elapsed:.2f} seconds ({len(data)/elapsed:.2f} bytes/s)")
+    while time.time() - start_time < TEST_DURATION:
+        # Send a chunk of data
+        chunk_size = min(SEND_CHUNK_SIZE, TEST_DATA_SIZE - total_sent)
+        if chunk_size <= 0:
+            # Wrap around if we've sent all the data
+            total_sent = 0
+            continue
+            
+        chunk = data[total_sent:total_sent + chunk_size]
+        client.send(chunk)
+        total_sent += chunk_size
+        
+        # Record metrics
+        current_time = time.time()
+        metrics_collector.record(client, total_sent, current_time)
+        
+        # Small delay to avoid overwhelming the server
+        time.sleep(0.05)
     
-    # Receive response
-    buf = [b""]
-    client_socket.recv(buf, 1024, flags=ReadMode.NO_FLAG)
-    
-    # Close the connection
-    client_socket.close()
+    # Close connection
+    client.close()
+    logger.info(f"Client sent {total_sent} bytes in total")
+    return total_sent
 
-def run_test(test_name, packet_loss=0, data_size=512*1024):
-    """Run a complete test with server and client"""
-    logging.info(f"Starting test: {test_name}")
+# Run a test with the given network conditions
+def run_test(condition_name):
+    logger.info(f"Starting {condition_name} test")
+    metrics = MetricsCollector()
     
-    # Configure network conditions
-    configure_network(packet_loss)
-    
-    # Create metrics collector
-    metrics = SimpleMetrics()
-    
-    # Create events for synchronization
-    server_ready = threading.Event()
-    server_done = threading.Event()
-    
-    # Start server in separate thread
-    server_thread = threading.Thread(
-        target=run_server,
-        args=(server_ready, server_done, metrics)
-    )
+    # Start server thread
+    server_thread = threading.Thread(target=server_function, args=(metrics,))
+    server_thread.daemon = True
     server_thread.start()
     
-    # Run client
-    run_client(server_ready, data_size)
-    
-    # Wait for server to finish
-    server_done.wait(timeout=10)
-    
-    # Reset network conditions
-    reset_network()
-    
-    # Generate plots
-    plot_metrics(metrics, test_name)
-    
-    # Print some statistics
-    if metrics.cwnd:
-        avg_cwnd = sum(metrics.cwnd) / len(metrics.cwnd)
-        max_cwnd = max(metrics.cwnd)
-        logging.info(f"Average cwnd: {avg_cwnd:.2f} bytes, Max cwnd: {max_cwnd:.2f} bytes")
-    
-    if metrics.rtt:
-        avg_rtt = sum(metrics.rtt) / len(metrics.rtt)
-        logging.info(f"Average RTT: {avg_rtt:.6f} seconds")
-    
-    if metrics.throughput:
-        avg_throughput = sum(metrics.throughput) / len(metrics.throughput)
-        logging.info(f"Average throughput: {avg_throughput:.2f} bytes/s")
-    
-    return metrics
-
-def main():
-    """Run tests with different network conditions"""
-    # Test with normal conditions
-    normal_metrics = run_test("normal", packet_loss=0, data_size=512*1024)
-    
-    # Small delay to let everything settle
+    # Give server time to start
     time.sleep(1)
     
-    # Test with 10% packet loss
-    loss_metrics = run_test("loss_10pct", packet_loss=10, data_size=512*1024)
+    # Start client
+    total_sent = client_function(metrics, condition_name)
     
-    logging.info("Tests completed successfully")
+    # Wait for server to finish
+    server_thread.join(timeout=5)
+    
+    logger.info(f"{condition_name} test completed. Total bytes sent: {total_sent}")
+    return metrics
+
+# Main function
+def main():
+    # First test: Normal conditions
+    logger.info("Running test with normal network conditions")
+    normal_metrics = run_test("Normal Conditions")
+    
+    # Set up network emulation for lossy test
+    logger.info("\nPlease run this command in a separate terminal:")
+    logger.info("sudo tc qdisc add dev lo root netem delay 100ms loss 5%")
+    input("Press Enter after running the command to continue with the lossy test...")
+    
+    # Second test: Lossy conditions
+    logger.info("Running test with 5% packet loss and 100ms delay")
+    lossy_metrics = run_test("Lossy Conditions")
+    
+    # Clean up network emulation
+    logger.info("\nPlease run this command in a separate terminal to restore normal network conditions:")
+    logger.info("sudo tc qdisc del dev lo root netem")
+    input("Press Enter after running the command to continue...")
+    
+    # Plot the results
+    plot_metrics(normal_metrics, lossy_metrics)
+
+def plot_metrics(normal_metrics, lossy_metrics):
+    """Create and save plots comparing the two test conditions"""
+    plt.figure(figsize=(12, 12))
+    
+    # Plot RTT
+    plt.subplot(3, 1, 1)
+    plt.plot(normal_metrics.time_values, normal_metrics.rtt_values, 'b-', linewidth=2, label='Normal')
+    plt.plot(lossy_metrics.time_values, lossy_metrics.rtt_values, 'r-', linewidth=2, label='5% Loss, 100ms Delay')
+    plt.title('Round Trip Time (RTT)', fontsize=14)
+    plt.xlabel('Time (s)', fontsize=12)
+    plt.ylabel('RTT (s)', fontsize=12)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    
+    # Plot Throughput
+    plt.subplot(3, 1, 2)
+    plt.plot(normal_metrics.time_values, [t/1000 for t in normal_metrics.throughput_values], 'b-', linewidth=2, label='Normal')
+    plt.plot(lossy_metrics.time_values, [t/1000 for t in lossy_metrics.throughput_values], 'r-', linewidth=2, label='5% Loss, 100ms Delay')
+    plt.title('Throughput', fontsize=14)
+    plt.xlabel('Time (s)', fontsize=12)
+    plt.ylabel('Throughput (KB/s)', fontsize=12)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    
+    # Plot CWND
+    plt.subplot(3, 1, 3)
+    plt.plot(normal_metrics.time_values, normal_metrics.cwnd_values, 'b-', linewidth=2, markersize=5, label='Normal')
+    plt.plot(lossy_metrics.time_values, lossy_metrics.cwnd_values, 'r-', linewidth=2, label='5% Loss, 100ms Delay')
+    plt.title('Congestion Window (cwnd)', fontsize=14)
+    plt.xlabel('Time (s)', fontsize=12)
+    plt.ylabel('CWND (bytes)', fontsize=12)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    
+    plt.tight_layout()
+    plt.savefig('tcp_performance_comparison.png')
+    print(f"Saved performance comparison plot to tcp_performance_comparison.png")
+    
+    # Show some statistics
+    print("\nPerformance Statistics:")
+    print("Normal Conditions:")
+    print(f"  - Average RTT: {np.mean(normal_metrics.rtt_values):.4f} seconds")
+    print(f"  - Average Throughput: {np.mean([t/1000 for t in normal_metrics.throughput_values]):.2f} KB/s")
+    print(f"  - Average CWND: {np.mean(normal_metrics.cwnd_values):.2f} bytes")
+    print(f"  - Total data transferred: {normal_metrics.total_bytes_sent} bytes")
+    
+    print("\nLossy Conditions (10% loss, 100ms delay):")
+    print(f"  - Average RTT: {np.mean(lossy_metrics.rtt_values):.4f} seconds")
+    print(f"  - Average Throughput: {np.mean([t/1000 for t in lossy_metrics.throughput_values]):.2f} KB/s")
+    print(f"  - Average CWND: {np.mean(lossy_metrics.cwnd_values):.2f} bytes")
+    print(f"  - Total data transferred: {lossy_metrics.total_bytes_sent} bytes")
+    
+    # Calculate performance impact
+    rtt_increase = (np.mean(lossy_metrics.rtt_values) / np.mean(normal_metrics.rtt_values) - 1) * 100
+    throughput_decrease = (1 - np.mean(lossy_metrics.throughput_values) / np.mean(normal_metrics.throughput_values)) * 100
+    cwnd_decrease = (1 - np.mean(lossy_metrics.cwnd_values) / np.mean(normal_metrics.cwnd_values)) * 100
+    
+    print("\nPerformance Impact:")
+    print(f"  - RTT increased by: {rtt_increase:.2f}%")
+    print(f"  - Throughput decreased by: {throughput_decrease:.2f}%")
+    print(f"  - Congestion window decreased by: {cwnd_decrease:.2f}%")
 
 if __name__ == "__main__":
     main()

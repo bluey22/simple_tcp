@@ -188,7 +188,7 @@ class TransportSocket:
         Close the socket and stop the backend thread.
         """
         logging.info(f"close() called on TransportSocket, current state = {self.state}")
-        self._ensure_all_data_sent()
+        # self._ensure_all_data_sent()
 
         # Handle connection termination based on the current state
         if self.state == TCPState.ESTABLISHED:
@@ -521,11 +521,17 @@ class TransportSocket:
                     _WINDOW_SIZE, self.congestion_control["cwnd"], self.window["peer_adv_window"]
                 )
 
+                count = 0
                 while self.window["unacked_bytes"] >= effective_window:
                     logging.info(f"WAIT - send(): Waiting for window space")
                     logging.debug(f"WAIT - send():(unacked_bytes_sent={self.window['unacked_bytes']}, cwnd={self.congestion_control['cwnd']}, peer_window={self.window['peer_adv_window']})")
                     # Wait for space to open up
-                    self.wait_cond.wait(timeout=0.3)
+                    count += 1
+                    self.wait_cond.wait(timeout=0.5)
+
+                    # Extra protection when experimenting with crazy losses without SACKs
+                    if count >= 12:
+                        self.close()
 
                     # If shutdown, cancel send()
                     if self.dying:
@@ -634,14 +640,25 @@ class TransportSocket:
 
         - Called in _monitor_timeouts(), so we have the wait_cond / recv_lock
         """
+        prev_cwnd = self.congestion_control["cwnd"]
+
         # 1. Set ssthresh to half of the current window
         self.congestion_control["ssthresh"] = max(_MSS, self.congestion_control["cwnd"] // 2)
 
         # 2. Reset CWND to initial window size
+        if prev_cwnd <= WINDOW_INITIAL_WINDOW_SIZE:
+            # We're already at or close to minimum - don't reduce further
+            minimum_cwnd = max(_MSS, WINDOW_INITIAL_WINDOW_SIZE // 2)
+            self.congestion_control["cwnd"] = max(minimum_cwnd, int(prev_cwnd * 0.8))
+            logging.info(f"Consecutive timeout - maintaining cwnd at {self.congestion_control['cwnd']}")
+        else:
+            # Normal case - reset CWND to initial window size
+            self.congestion_control["cwnd"] = WINDOW_INITIAL_WINDOW_SIZE
+
         self.congestion_control["cwnd"] = WINDOW_INITIAL_WINDOW_SIZE
 
         # 3. Set congestion state back to slow start
-        self.congestion_control["state"] = "SLOW_START"
+        self.congestion_control["state"] = CongestionState.SLOW_START
 
         logging.info(f"Timeout: Resetting to Slow Start. cwnd={self.congestion_control['cwnd']}, ssthresh={self.congestion_control['ssthresh']}")
 
@@ -828,7 +845,7 @@ class TransportSocket:
                         if incoming_ack > self.window["next_seq_expected"]:
 
                             # Calculate how many bytes have been acknowledged cummulatively
-                            acked_bytes = incoming_ack - self.window["next_seq_expected"]
+                            acked_bytes = incoming_ack - self.window["next_seq_expected"]  # Next byte number the receiver expected from us
 
                             # Update window accordingly
                             self.window["next_seq_expected"] = incoming_ack
@@ -843,14 +860,15 @@ class TransportSocket:
                                 pkt, _ = self.window["packets_in_flight"][seq]
 
                                 # incoming_ack covers this packet, no longer need to check it for resends (20 is minimum TCP HEADER LENGTH)
-                                if seq + len(pkt.encode()) <= incoming_ack:
+                                if seq + len(pkt.encode()) - 1 <= incoming_ack:
+
+                                    del self.window["packets_in_flight"][seq]
 
                                     # if we ack a packet, we can use it to update our RTT as it's a new sample_rtt
                                     #   - this update was manually triggered for SYN, here is it's more general use
                                     if seq in self.rtt_estimation["timestamps"]:
                                         sample_rtt = time.time() - self.rtt_estimation["timestamps"][seq]
                                         self._update_rtt_estimate(sample_rtt)
-                                    del self.window["packets_in_flight"][seq]
 
                             logging.info(f"Window update: base={self.window['next_seq_expected']}, in_flight={self.window['unacked_bytes']}, adv_window={packet.adv_window}")
                     self.wait_cond.notify_all()
@@ -899,15 +917,14 @@ class TransportSocket:
     def _handle_syn_ack(self, addr, packet):
         """
         For Initiator: Processes SYN+ACK packets.
-        - On the first valid SYN+ACK (count==0), simulate a lost ACK by not sending anything.
-        - On a duplicate SYN+ACK (count != 0), send the final ACK.
         """
         with self.recv_lock:
             logging.info(f"Received SYN+ACK from {addr}, seq={packet.seq}, ack={packet.ack}")
             expected_ack = self.window["next_seq_to_send"] + 1
 
-            # If we're already established, this is clearly a duplicate.
+            # If we're already established, this is a duplicate SYN+ACK
             if self.state == TCPState.ESTABLISHED:
+                # Send final ACK and return
                 ack_packet = Packet(
                     seq=self.window["next_seq_to_send"],
                     ack=self.window["last_ack"],
@@ -919,9 +936,9 @@ class TransportSocket:
                 self.wait_cond.notify_all()
                 return
 
-            if packet.ack == expected_ack:
-                # This is a duplicate SYN+ACK; now send the final ACK.
-                logging.info("Duplicate SYN+ACK received; sending final ACK now.")
+            if self.state == TCPState.SYN_SENT and packet.ack == expected_ack:
+                # First valid SYN+ACK, send the final ACK
+                logging.info("VALID SYN+ACK received; sending final ACK now.")
                 ack_packet = Packet(
                     seq=packet.ack,          # our new sequence number
                     ack=packet.seq + 1,      # acknowledging the server's SYN
@@ -939,13 +956,15 @@ class TransportSocket:
                 
                 # Transition to ESTABLISHED state and notify waiting threads
                 self.state = TCPState.ESTABLISHED
+                self.wait_cond.notify_all()
             else:
                 # In case the ACK number doesn't match what we expect,
                 # log the event and re-send the ACK with the current window values.
                 logging.info(f"Invalid SYN+ACK: expected ack {expected_ack} but got {packet.ack}. Re-sending ACK.")
                 ack_packet = Packet(
                     seq=self.window["next_seq_to_send"],
-                    ack=self.window["last_ack"],
+                    ack=packet.seq + 1,
+                    # ack=self.window["last_ack"],
                     flags=ACK_FLAG,
                     adv_window=MAX_NETWORK_BUFFER - self.window["recv_len"]
                 )

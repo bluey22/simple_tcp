@@ -35,7 +35,20 @@ sudo tc qdisc del dev lo root netem
 
 # Visualize RTT, Throughput, and Congestion Control
 1) Complete the setup in Project Setup
-2) Run simple_tcp_test.py
+2) Run simple_tcp_test.py and follow the console instructions
+    - IMPORTANT: You'll have to hit enter 3 times to advance (it will prompt you, but may disappear). 1 For start, 2 for loss conditions, 3 for results. If the terminal hangs, try enter before retrying or ctrl + c. You will get prompted, this is just a reminder if it disappears from the console, so please be patient (sorry)
+    - You'll be prompted to open up another terminal and try 5% loss. We're blasting data here, so I wouldn't really go above this. Can see breaks after this point.
+```bash
+    # simple_tcp_test.py summary
+
+    # Run normally first
+
+    # Run this command in a separate terminal (per console instructions)
+    sudo tc qdisc add dev lo root netem delay 100ms loss 5%
+
+    # Press enter for final results and graphs, but don't forget this to get normal network conditions back
+    sudo tc qdisc del dev lo root netem
+```
 
 Please see [TCP Notes](tcp_notes.md) for further information about TCP that I used to build this.
 
