@@ -583,11 +583,18 @@ class TransportSocket:
                 current_time = time.time()
                 for seq_no, (packet, timestamp) in list(self.window["packets_in_flight"].items()):
                     if seq_no + len(packet.encode()) <= self.window["next_seq_expected"]:
-                        # This packet is fully acknowledged; remove it and do not retransmit
+                        # Case 1: This packet is fully acknowledged; remove it and do not retransmit
                         del self.window["packets_in_flight"][seq_no]
                         continue
+
                     if current_time - timestamp > dynamic_timeout:
+                        # Case 2: Packet is timed out
                         logging.info(f"Timeout: Retransmitting segment (seq={seq_no})")
+
+                        # Apply/Update congestion control
+                        self._handle_congestion_control_timeout()
+
+                        # Resend packet
                         self.sock_fd.sendto(packet.encode(), self.conn)
                         
                         # Update the timestamp for the retransmitted packet
@@ -596,6 +603,43 @@ class TransportSocket:
                 # Notify any waiting threads that window state may have changed (e.g. if ACKs arrive)
                 self.wait_cond.notify_all()
             time.sleep(0.5)
+
+    def _handle_congestion_control_ack(self, acked_bytes):
+        """
+        Helper method called by _backend() (Case 3.3.2) to update
+        congestion control parameters on a successful ACK.
+        - Implements slow start and congestion avoidance
+        """
+        if self.congestion_control["state"] == CongestionState.SLOW_START:
+            # 1. In slow start, increase cwnd by MSS for each ACK
+            self.congestion_control["cwnd"] += min(acked_bytes, _MSS)
+            logging.info(f"Slow Start: cwnd increased to {self.congestion_control['cwnd']}")
+
+            # 2. Check if we've hit our slow start threshold (transition to linear growth / congestion avoidance)
+            if self.congestion_control["cwnd"] >= self.congestion_control["ssthresh"]:
+                self.congestion_control["state"] = CongestionState.CONGESTION_AVOIDANCE
+                logging.info(f"Transitioning to Congestion Avoidance: (cwnd={self.congestion_control['cwnd']}, ssthresh={self.congestion_control['ssthresh']})")
+
+        elif self.congestion_control["state"] == CongestionState.CONGESTION_AVOIDANCE:
+            # 1. In congestion avoidance, increase cwnd by MSS * (MSS/cwnd) for each ACK (~ increase of 1 MSS per RTT)
+            self.congestion_control["cwnd"] += max(1, (_MSS * _MSS) // self.congestion_control["cwnd"])
+            logging.info(f"Congestion Avoidance: cwnd increased to {self.congestion_control['cwnd']}")
+
+    def _handle_congestion_control_timeout(self):
+        """
+        Helper method called by _monitor_timeouts() to update
+        congestion control parameters on a timeout (packet loss detected).
+        """
+        # 1. Set ssthresh to half of the current window
+        self.congestion_control["ssthresh"] = max(_MSS, self.congestion_control["cwnd"] // 2)
+
+        # 2. Reset CWND to initial window size
+        self.congestion_control["cwnd"] = WINDOW_INITIAL_WINDOW_SIZE
+
+        # 3. Set congestion state back to slow start
+        self.congestion_control["state"] = "SLOW_START"
+
+        logging.info(f"Timeout: Resetting to Slow Start. cwnd={self.congestion_control['cwnd']}, ssthresh={self.congestion_control['ssthresh']}")
 
     # ---------------------------- Connection Control Helpers ------------------------------------
     def _time_wait_to_closed(self):
@@ -655,7 +699,7 @@ class TransportSocket:
 
                 # 3. Evaluate the type of packet received and handle accordingly
                 
-                # 3.1 CONNECTION ESTABLISHMENT CASES
+                # 3.1 CONNECTION ESTABLISHMENT CASES ---------------------------------------------------------------
                 if self.state == TCPState.LISTEN and (packet.flags & SYN_FLAG) != 0:
                     # CASE 1: LISTENER RECEIVES SYN, SEND SYN+ACK
                     self._handle_syn(addr, packet)
@@ -672,7 +716,7 @@ class TransportSocket:
                     self._handle_final_ack_conn(addr, packet)
                     continue
 
-                # 3.2 CONNECTION TERMINATION CASES
+                # 3.2 CONNECTION TERMINATION CASES ---------------------------------------------------------------
                 elif self.state == TCPState.ESTABLISHED and (packet.flags & FIN_FLAG) != 0:
                     # CASE 1: RECEIVE FIN REQUEST (LISTENER/PASSIVE CLOSE), ACK and send FIN
                     self._handle_fin_passive(addr, packet)
@@ -708,16 +752,16 @@ class TransportSocket:
                         self.wait_cond.notify_all()
                     continue
 
-                # 3.3 DATA PACKET HANDLING
+                # 3.3 DATA PACKET HANDLING ---------------------------------------------------------------
                 with self.recv_lock:
                     incoming_seq = packet.seq
                     incoming_ack = packet.ack
 
                     # We split up data handling (or ACK receptions in client-server) into a 2 step process:
-                    #   - 3.3.1 Process Payload Data for our RECV buffers
-                    #   - 3.3.2 Update our window if we received an ACK (no matter what)
+                    #   - 3.3.1 Process Payload Data for our RECV buffers (DATA ONLY)
+                    #   - 3.3.2 Update our window if we received an ACK (ACK ONLY)
                     
-                    # 3.3.1 Process ACK+payload first if we're in an appropriate state
+                    # 3.3.1 Process Payload first if we're in an appropriate state (ACK check right after)
                     if self.state in [TCPState.ESTABLISHED, TCPState.CLOSE_WAIT] and len(packet.payload) > 0:
                         # Case 1: We receive an in-order packet
                         if incoming_seq == self.window["last_ack"]:
@@ -776,7 +820,7 @@ class TransportSocket:
                     if (packet.flags & ACK_FLAG) != 0:
                         logging.info(f"Received ACK packet! \n\t - Packet Data: seq={incoming_seq}, ack={incoming_ack}")
                         
-                        # Check if ACK number advances our window (trust sender)
+                        # Check if ACK number advances our window (if dup or behind, do nothing - timeouts will handle retransmission)
                         if incoming_ack > self.window["next_seq_expected"]:
 
                             # Calculate how many bytes have been acknowledged cummulatively
@@ -786,6 +830,9 @@ class TransportSocket:
                             self.window["next_seq_expected"] = incoming_ack
                             self.window["peer_adv_window"] = packet.adv_window
                             self.window["unacked_bytes"] = max(0, self.window["unacked_bytes"] - acked_bytes)
+
+                            # Update congestion control parameters due to successful ACK
+                            self._handle_congestion_control_ack(acked_bytes)
 
                             # Remove packets_in_flight if this ACK covers them
                             for seq in list(self.window["packets_in_flight"].keys()):
