@@ -614,7 +614,7 @@ class TransportSocket:
         """
         if self.congestion_control["state"] == CongestionState.SLOW_START:
             # 1. In slow start, increase cwnd by MSS for each ACK
-            self.congestion_control["cwnd"] += min(acked_bytes, _MSS)
+            self.congestion_control["cwnd"] += min(acked_bytes, _MSS)  # In case ACK covers more than 1 segment
             logging.info(f"Slow Start: cwnd increased to {self.congestion_control['cwnd']}")
 
             # 2. Check if we've hit our slow start threshold (transition to linear growth / congestion avoidance)
