@@ -6,8 +6,10 @@ Implements TCP over UDP with custom header packet headers, sliding window algori
 - Python: 3.10.12 Linux: 22.0.4 Ubuntu
 
 ## Project Setup
-IF YOU WANT TO RUN `Visualize RTT, Throughput, and Congestion Control` TO GRAPH TEST RESULTS, Set up a virtual environment and install requirements.
+Only needed for section `Visualize RTT, Throughput, and Congestion Control` to graph test results.
 - You can still run `HOW TO RUN` below without a virtual environment, and skip this section.
+
+Set up a local virtual environment and download requirements:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
