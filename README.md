@@ -5,6 +5,16 @@ Implements TCP over UDP with custom header packet headers, sliding window algori
 - @bluey22
 - Python: 3.10.12 Linux: 22.0.4 Ubuntu
 
+## Project Setup
+IF YOU WANT TO RUN `Visualize RTT, Throughput, and Congestion Control` TO GRAPH TEST RESULTS, Set up a virtual environment and install requirements.
+- You can still run `HOW TO RUN` below without a virtual environment, and skip this section.
+```bash
+python3 -m venv venv
+source venv/bin/activate
+
+pip install r requirements.txt
+```
+
 # HOW TO RUN
 Note: Might need to run more than once for coherence - I've tested in multiple conditions and was able to get solid results every time, but just a warning.
 1) Open up two terminals
@@ -22,6 +32,10 @@ sudo tc qdisc del dev lo root netem
 ```
     - This will allow you to see retransmits and more interesting happenings
     - WIll also change the RTT estimations
+
+# Visualize RTT, Throughput, and Congestion Control
+1) Complete the setup in Project Setup
+2) Run simple_tcp_test.py
 
 Please see [TCP Notes](tcp_notes.md) for further information about TCP that I used to build this.
 
