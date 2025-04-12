@@ -1,8 +1,6 @@
 # simple_tcp
-Implements TCP over UDP with custom header packet headers, sliding window algorithm, flow controw, and (soon) congestion control.
+Implements simple TCP over UDP with custom header packet headers, sliding window algorithm, flow controw, and congestion control (Tahoe).
 
-- Project 3 for CSDS 325: Networks
-- @bluey22
 - Python: 3.10.12 Linux: 22.0.4 Ubuntu
 
 ## Project Setup
@@ -18,13 +16,9 @@ pip install r requirements.txt
 ```
 
 # HOW TO RUN
-Note: Might need to run more than once for coherence - I've tested in multiple conditions and was able to get solid results (most of the time), but just a warning.
+Note: Might need to run more than once for coherent outputs - my apologies. Should work well under good to moderate network settings.
 1) Open up two terminals
 2) run server.py in one, and client.py in the other. You can observe the console outputs directly or use wireshark (see tcp_over_udp.lua)
-    - Sometimes you'll see the randomly generated data in the client and/or server, sometimes you won't
-        - These are race conditions due to the single recv() call in each, maybe they'll be in the buffer, maybe they won't
-        - The application layer / socket program that uses our socket is suppose to parse and account for this, ensuring normal
-            usage of the API (always calling close(), responsible calls to send(), recv())
 3) At the end of the console, you can see the alpha value and the final estimated RTT (you can play around with the _ALPHA parameter at the top of transport.py)
 
 For 2) Try running it in perfect conditions. Then, you can alter network conditions with the following commands:
@@ -56,7 +50,7 @@ Please tcp_performance_big_ssthresh.png and tcp_performance_small_ssthresh.png (
 
 Please see [TCP Notes](tcp_notes.md) for further information about TCP that I used to build this.
 
-# RTT, Throughput, and CWND monitoring (recording jumps the peaks, have to fix)
+# RTT, Throughput, and CWND monitoring (Test script connecting jumps the peaks, have to fix)
 <img src="./tcp_performance_big_ssthresh.png" alt="Connection Termination Interaction Diagram" width="400"/>
 <img src="./tcp_performance_small_ssthresh.png" alt="Connection Termination Interaction Diagram" width="400"/>
 
